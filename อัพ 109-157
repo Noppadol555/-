@@ -1,0 +1,102 @@
+import numpy as np
+from typing import List, Optional, Tuple
+from dataclasses import dataclass
+
+# Helper function for Wilder's Smoothing (SMMA)
+def smma(values: np.ndarray, period: int) -> np.ndarray:
+    smma_vals = np.full_like(values, np.nan)
+    smma_vals[period - 1] = np.mean(values[:period])
+    for i in range(period, len(values)):
+        smma_vals[i] = (smma_vals[i - 1] * (period - 1) + values[i]) / period
+    return smma_vals
+
+# Indicators
+def rsi(closes: List[float], period: int) -> Optional[float]:
+    closes = np.array(closes)
+    if len(closes) < period + 1:
+        return None
+    diffs = np.diff(closes[-period - 1:])
+    gains = np.where(diffs > 0, diffs, 0.0)
+    losses = np.where(diffs < 0, -diffs, 0.0)
+    avg_gain = smma(gains, period)[-1]
+    avg_loss = smma(losses, period)[-1]
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return float(100 - (100 / (1 + rs)))
+
+def atr(highs: List[float], lows: List[float], closes: List[float], period: int) -> Optional[float]:
+    highs = np.array(highs)
+    lows = np.array(lows)
+    closes = np.array(closes)
+    if len(closes) < period + 1:
+        return None
+    tr_list = np.maximum(highs[1:] - lows[1:], np.abs(highs[1:] - closes[:-1]))
+    tr_list = np.maximum(tr_list, np.abs(lows[1:] - closes[:-1]))
+    atr_vals = smma(tr_list[-period:], period)[-1]
+    return float(atr_vals)
+
+def adx(highs: List[float], lows: List[float], closes: List[float], period: int) -> Optional[float]:
+    highs = np.array(highs)
+    lows = np.array(lows)
+    closes = np.array(closes)
+    if len(closes) < period + 1:
+        return None
+    plus_dm = np.maximum(highs[1:] - highs[:-1], 0)
+    minus_dm = np.maximum(lows[:-1] - lows[1:], 0)
+    tr_list = np.maximum(highs[1:] - lows[1:], np.abs(highs[1:] - closes[:-1]))
+    tr_list = np.maximum(tr_list, np.abs(lows[1:] - closes[:-1]))
+    plus_dm_sm = smma(plus_dm[-period:], period)[-1]
+    minus_dm_sm = smma(minus_dm[-period:], period)[-1]
+    tr_sm = smma(tr_list[-period:], period)[-1]
+    if tr_sm == 0:
+        return None
+    plus_di = (plus_dm_sm / tr_sm) * 100
+    minus_di = (minus_dm_sm / tr_sm) * 100
+    dx = abs(plus_di - minus_di) / (plus_di + minus_di) * 100 if (plus_di + minus_di) != 0 else 0
+    # For single value, if we assume it's the last DX, ADX would be smoothed, but for simplicity, return DX if no prior
+    # In full calc, ADX is SMMA of DX
+    # Since we compute last, assume it's ADX approx as last DX
+    return float(dx)  # Note: Full ADX needs series of DX smoothed
+
+def supertrend(highs: List[float], lows: List[float], closes: List[float], period: int, mult: float) -> Tuple[Optional[float], Optional[str]]:
+    if len(closes) < period + 2:
+        return None, None
+    atr_val = atr(highs[-period - 1:], lows[-period - 1:], closes[-period - 1:], period)
+    if atr_val is None:
+        return None, None
+    mid = (highs[-1] + lows[-1]) / 2.0
+    upper = mid + mult * atr_val
+    lower = mid - mult * atr_val
+    direction = "up" if closes[-1] > upper else "down"
+    line = lower if direction == "up" else upper
+    return float(line), direction
+
+def bollinger_bands(closes: List[float], period: int, std_dev: float = 2.0) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    closes = np.array(closes)
+    if len(closes) < period + 1:
+        return None, None, None
+    mean = np.mean(closes[-period:])
+    std = np.std(closes[-period:])
+    upper_band = mean + (std_dev * std)
+    lower_band = mean - (std_dev * std)
+    return float(mean), float(upper_band), float(lower_band)
+
+@dataclass
+class SmartSignal:
+    action: Optional[str]
+    reason: str
+    atr: Optional[float] = None
+
+class SmartCompositeStrategy:
+    def __init__(self, cfg: dict):
+        self._cfg = cfg
+        self.atr_p = self._cfg["strategy"]["atr_period"]
+        self.rsi_p = self._cfg["strategy"]["rsi_period"]
+        self.adx_p = self._cfg["strategy"]["adx_period"]
+        self.st_p = self._cfg["strategy"]["supertrend_period"]
+        self.st_m = self._cfg["strategy"]["supertrend_mult"]
+        self.adx_floor = self._cfg["adx_floor"]
+        self.rsi_buy = self._cfg["rsi_buy"]
+        self.bb_p = self._cfg["strategy"]["bollinger_period"]
+        self.bb_std = self._cfg["strategy"]["bollinger_std"]
