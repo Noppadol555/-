@@ -24,7 +24,7 @@ CONFIG = {
     'max_api_retries': 10,
     'api_timeout': 30,
     'futures_weight': 0.9,
-    'rate_limit_per_minute': 6000,
+    'rate_limit_per_minute': 2400,
     'max_drawdown': 0.2,
     'max_leverage_per_symbol': {},  # จะถูกอัพเดทโดย fetch_max_leverage
 }
@@ -52,7 +52,7 @@ class APIManager:
     def __init__(self):
         """เริ่มต้นตัวแปรสำหรับจัดการ API และ rate limit"""
         self.weight_used = 0
-        self.weight_limit = 6000  # อัพเดทตาม Binance 2025
+        self.weight_limit = 2400  # อัพเดทตาม Binance 2025
         self.last_reset = time.time()
         self.is_rate_limited = False
         self.ban_until = 0
