@@ -1,0 +1,232 @@
+import asyncio
+import json
+import sqlite3
+import pandas as pd
+import logging
+import ccxt.async_support as ccxt_async
+import websockets
+from tenacity import retry, wait_exponential, stop_after_attempt
+from datetime import datetime
+
+# การตั้งค่า CONFIG (ใช้เฉพาะที่เกี่ยวข้องกับ WebSocketManager)
+CONFIG = {
+    'dry_run': False,
+    'multi_tf_list': ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d'],
+    'system_running': False,
+}
+
+# คลาส WebSocketManager: จัดการ WebSocket เพื่อรับข้อมูลเรียลไทม์จาก Binance
+class WebSocketManager:
+    def __init__(self):
+        """เริ่มต้นตัวแปรสำหรับ WebSocket และ SQLite"""
+        self.url = 'wss://fstream.binance.com/ws'
+        self.backup_url = 'wss://stream.binance.com:9443/ws'
+        self.data = {}
+        self.running = False
+        self.subscribed_symbols = set()
+        self.reconnect_attempts = 0
+        self.max_reconnects = 10
+        self.cache = {}
+        self.all_usdt_pairs = []
+        self.db_conn = sqlite3.connect('ws_backup.db', timeout=10)
+        self.db_conn.execute("CREATE TABLE IF NOT EXISTS ws_data (symbol TEXT, timeframe TEXT, timestamp REAL, close REAL, volume REAL, funding_rate REAL, depth REAL)")
+        self.balance_data = {'free': 0, 'locked': 0}
+        self.position_data = {}
+        self.multi_tf_data = {tf: {} for tf in CONFIG['multi_tf_list']}
+
+    @retry(wait=wait_exponential(multiplier=1, min=4, max=60), stop=stop_after_attempt(5))
+    async def fetch_all_usdt_pairs(self):
+        """ดึงรายการคู่ USDT ทั้งหมดจาก Binance"""
+        api_manager = APIManager()
+        await api_manager.rate_limit_control()
+        markets = await api_manager.exchange.load_markets()
+        self.all_usdt_pairs = [s for s in markets.keys() if s.endswith('/USDT')]
+        logging.info(f"ดึงคู่ USDT ทั้งหมด: {len(self.all_usdt_pairs)} เหรียญ")
+
+    async def update_symbols(self, symbols):
+        """อัพเดทสัญลักษณ์ที่สมัครรับข้อมูล WebSocket"""
+        new_symbols = [s.lower().replace('/', '') + '@kline_' + tf for s in symbols for tf in CONFIG['multi_tf_list']]
+        if set(new_symbols) != self.subscribed_symbols:
+            self.subscribed_symbols = set(new_symbols[:1024])
+            if self.running:
+                await self.resubscribe()
+
+    async def resubscribe(self, websocket=None):
+        """สมัครรับข้อมูล WebSocket ใหม่"""
+        api_manager = APIManager()
+        await api_manager.rate_limit_control()
+        if websocket:
+            await websocket.send(json.dumps({
+                'method': 'SUBSCRIBE',
+                'params': ['!userData@balance', '!userData@position'] + list(self.subscribed_symbols),
+                'id': 1
+            }))
+
+    async def start(self, symbols):
+        """เริ่มต้นการเชื่อมต่อ WebSocket"""
+        if not self.all_usdt_pairs:
+            await self.fetch_all_usdt_pairs()
+        await self.update_symbols(symbols)
+        self.running = True
+        urls = [self.url, self.backup_url]
+        current_url_idx = 0
+        while self.running and CONFIG['system_running']:
+            try:
+                async with websockets.connect(urls[current_url_idx]) as websocket:
+                    await self.resubscribe(websocket)
+                    self.reconnect_attempts = 0
+                    while self.running and CONFIG['system_running']:
+                        message = await asyncio.wait_for(websocket.recv(), timeout=10)
+                        data = json.loads(message)
+                        await self._handle_message(data, websocket)
+            except (websockets.ConnectionClosed, asyncio.TimeoutError) as e:
+                self.reconnect_attempts += 1
+                logging.warning(f"WebSocket ล้มเหลว: {e}, พยายามใหม่ครั้งที่ {self.reconnect_attempts}")
+                if self.reconnect_attempts > self.max_reconnects:
+                    logging.error("WebSocket ล้มเหลวเกินจำกัด ใช้ข้อมูลสำรอง")
+                    await self.use_fallback_data(symbols)
+                await asyncio.sleep(min(5 * self.reconnect_attempts, 60))
+                current_url_idx = (current_url_idx + 1) % len(urls)
+
+    async def stop(self):
+        """หยุดการเชื่อมต่อ WebSocket"""
+        self.running = False
+        self.db_conn.close()
+
+    async def _handle_message(self, data, websocket):
+        """จัดการข้อความที่ได้รับจาก WebSocket"""
+        if 'ping' in data:
+            await websocket.send(json.dumps({'pong': data['ping']}))
+            logging.info("ส่ง pong ตอบ ping จาก Binance")
+        elif 'e' in data and data['e'] == 'balanceUpdate':
+            self._update_balance(data)
+        elif 'e' in data and data['e'] == 'position':
+            self._update_position(data)
+        elif 'e' in data and data['e'] == 'kline':
+            symbol = data['s']
+            timeframe = data['k']['i']
+            self._update_data(symbol, timeframe, data['k'])
+            await self.save_to_sqlite(symbol, timeframe, data['k'])
+
+    def _update_balance(self, data):
+        """อัพเดทยอดเงินเรียลไทม์จาก WebSocket"""
+        asset = data.get('a', 'USDT')
+        if asset == 'USDT':
+            self.balance_data = {
+                'free': float(data.get('f', 0)),
+                'locked': float(data.get('l', 0))
+            }
+            logging.debug(f"อัพเดทยอดเงิน USDT: free={self.balance_data['free']}, locked={self.balance_data['locked']}")
+
+    def _update_position(self, data):
+        """อัพเดทข้อมูลตำแหน่งเรียลไทม์"""
+        symbol = data.get('s')
+        if symbol:
+            self.position_data[symbol] = {
+                'size': float(data.get('ps', 0)),
+                'entryPrice': float(data.get('ep', 0)),
+                'leverage': float(data.get('lev', 1))
+            }
+
+    def _update_data(self, symbol, timeframe, kline):
+        """อัพเดทข้อมูลราคาและ indicator สำหรับ timeframe เฉพาะ"""
+        if symbol not in self.data:
+            self.data[symbol] = {}
+        self.data[symbol][timeframe] = {
+            'close': float(kline['c']),
+            'volume': float(kline['v']),
+            'timestamp': datetime.utcnow(),
+            'funding_rate': float(kline.get('r', 0.0001)),
+            'depth': float(kline.get('b', 0)) - float(kline.get('a', 0))
+        }
+        self.cache[symbol + timeframe] = self.data[symbol][timeframe]
+        if len(self.cache) > 1000:
+            self.cache.pop(next(iter(self.cache)))
+        self.multi_tf_data[timeframe][symbol] = self.data[symbol][timeframe]
+
+    async def save_to_sqlite(self, symbol, timeframe, kline):
+        """บันทึกข้อมูลลง SQLite"""
+        with self.db_conn:
+            self.db_conn.execute(
+                "INSERT INTO ws_data (symbol, timeframe, timestamp, close, volume, funding_rate, depth) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (symbol, timeframe, datetime.utcnow().timestamp(), float(kline['c']), float(kline['v']),
+                 float(kline.get('r', 0.0001)), float(kline.get('b', 0)) - float(kline.get('a', 0)))
+            )
+            self.db_conn.commit()
+
+    async def fetch_backup_data(self, symbol, timeframe):
+        """ดึงข้อมูลสำรองจาก SQLite"""
+        with self.db_conn:
+            cursor = self.db_conn.execute(
+                "SELECT close, volume, funding_rate, depth FROM ws_data WHERE symbol=? AND timeframe=? ORDER BY timestamp DESC LIMIT 100",
+                (symbol, timeframe)
+            )
+            data = cursor.fetchall()
+        if data:
+            df = pd.DataFrame(data, columns=['close', 'volume', 'funding_rate', 'depth'])
+            logging.info(f"ดึงข้อมูลสำรองสำหรับ {symbol} ({timeframe}): {len(df)} แถว")
+            return df
+        return pd.DataFrame()
+
+    async def use_fallback_data(self, symbols):
+        """ใช้ข้อมูลสำรองเมื่อ WebSocket ล้มเหลว"""
+        api_manager = APIManager()
+        for symbol in symbols:
+            for tf in CONFIG['multi_tf_list']:
+                if symbol not in self.data or tf not in self.data[symbol]:
+                    df = await self.fetch_backup_data(symbol, tf)
+                    if not df.empty:
+                        self.data[symbol][tf] = {
+                            'close': df['close'].iloc[-1],
+                            'volume': df['volume'].iloc[-1],
+                            'timestamp': datetime.utcnow(),
+                            'funding_rate': df['funding_rate'].iloc[-1],
+                            'depth': df['depth'].iloc[-1]
+                        }
+                    else:
+                        await api_manager.rate_limit_control()
+                        try:
+                            ticker = await api_manager.exchange.fetch_ticker(symbol)
+                            self.data[symbol][tf] = {
+                                'close': ticker['last'],
+                                'volume': 100,
+                                'timestamp': datetime.utcnow(),
+                                'funding_rate': 0.0001,
+                                'depth': 0
+                            }
+                        except Exception as e:
+                            logging.error(f"ดึงข้อมูลสำรองสำหรับ {symbol} ({tf}) ล้มเหลว: {e}")
+                    logging.info(f"ใช้ข้อมูลสำรองสำหรับ {symbol} ({tf}): ราคา {self.data[symbol][tf]['close']}")
+                    self.multi_tf_data[tf][symbol] = self.data[symbol][tf]
+
+    def get_latest_price(self, symbol, timeframe='1m'):
+        """ดึงราคาล่าสุดสำหรับ timeframe เฉพาะ"""
+        default_price = 10000
+        return self.cache.get(symbol + timeframe, self.data.get(symbol, {}).get(timeframe, {})).get('close', default_price)
+
+    def get_latest_balance(self):
+        """ดึงยอดเงินล่าสุดจาก WebSocket"""
+        return self.balance_data.get('free', 0)
+
+    async def prefetch_data(self, symbols, timeframes):
+        """ดึงข้อมูลล่วงหน้าสำหรับ timeframe ต่าง ๆ"""
+        api_manager = APIManager()
+        for symbol in symbols:
+            for tf in timeframes:
+                await api_manager.rate_limit_control()
+                try:
+                    klines = await api_manager.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=100)
+                    df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    if symbol not in self.data:
+                        self.data[symbol] = {}
+                    self.data[symbol][tf] = {
+                        'close': df['close'].iloc[-1],
+                        'volume': df['volume'].iloc[-1],
+                        'timestamp': datetime.utcnow(),
+                        'funding_rate': 0.0001,
+                        'depth': 0
+                    }
+                    self.multi_tf_data[tf][symbol] = self.data[symbol][tf]
+                    logging.debug(f"ดึงข้อมูลล่วงหน้าสำหรับ {symbol} ใน {tf} สำเร็จ")
+                except Exception as e:
+                    logging.error(f"ดึงข้อมูลล่วงหน้าสำหรับ {symbol} ใน {tf} ล้มเหลว: {e}")
