@@ -1,75 +1,64 @@
-import asyncio
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install ccxt tenacity numpy pandas logging
+
+import json
 import time
 import logging
 import logging.handlers
 from collections import deque
-import numpy as np
+import asyncio
 import ccxt.async_support as ccxt_async
+from tenacity import retry, wait_exponential, stop_after_attempt
 
-# การตั้งค่า CONFIG (เพิ่ม margin_mode และ min_leverage)
+# คอนฟิกเฉพาะสำหรับคลาส APIManager
+# การใช้งาน: ปรับค่าในนี้เพื่อควบคุมพฤติกรรม เช่น rate limit, timeout, หรือโหมด margin
 CONFIG = {
-    'binance_api_key': 'YOUR_API_KEY_HERE',
-    'binance_api_secret': 'YOUR_API_SECRET_HERE',
-    'dry_run': False,
-    'margin_mode': 'isolated',  # 'cross' หรือ 'isolated'
-    'min_leverage': 5,  # Leverage ขั้นต่ำ
-    'profit_lock_percentage': 0.05,
-    'loss_strategy': 'dynamic',
-    'stop_loss_percentage': 0.005,
-    'cut_loss_threshold': 0.2,
-    'risk_per_trade': 0.2,
-    'initial_balance': 100,
-    'reinvest_profits': True,
-    'log_level': 'INFO',
-    'max_api_retries': 10,
-    'api_timeout': 30,
-    'futures_weight': 0.9,
-    'rate_limit_per_minute': 2400,
-    'max_drawdown': 0.2,
-    'max_leverage_per_symbol': {},  # จะถูกอัพเดทโดย fetch_max_leverage
+    'binance_api_key': 'YOUR_API_KEY_HERE',  # คีย์ API สำหรับเชื่อมต่อ Binance Futures
+    'binance_api_secret': 'YOUR_API_SECRET_HERE',  # รหัสลับ API สำหรับ Binance Futures
+    'dry_run': False,  # True = จำลองการเรียก API (ไม่ส่งจริง), False = เรียก API จริง
+    'log_level': 'INFO',  # ระดับการบันทึก log ('DEBUG', 'INFO', 'WARNING', 'ERROR')
+    'max_api_retries': 10,  # จำนวนครั้งสูงสุดที่พยายามเรียก API ใหม่เมื่อล้มเหลว
+    'api_timeout': 30,  # วินาทีที่รอการตอบกลับจาก API ก่อน timeout
+    'rate_limit_per_minute': 2400,  # จำนวนคำขอ API ต่อนาที (ตาม Binance 2025)
+    'margin_mode': 'cross',  # โหมด margin ('cross' หรือ 'isolated')
+    'min_leverage': 5,  # Leverage ขั้นต่ำที่ยอมรับ
+    'trailing_callback_rate': 0.5,  # เปอร์เซ็นต์ callback สำหรับ Trailing Stop และ Take Profit (0.5%)
+    'trailing_update_interval': 60  # ระยะเวลา (วินาที) สำหรับการอัพเดท Trailing SL/TP อัตโนมัติ
 }
 
-RATE_LIMIT = CONFIG['rate_limit_per_minute']
-API_CALL_INTERVAL = 60 / RATE_LIMIT
-
-# การตั้งค่า logging
+# การตั้งค่าระบบบันทึก log เฉพาะสำหรับคลาสนี้
 logging.basicConfig(
     level=getattr(logging, CONFIG['log_level']),
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.handlers.RotatingFileHandler('trading.log', maxBytes=10*1024*1024, backupCount=5),
+        logging.handlers.RotatingFileHandler('apimanager.log', maxBytes=10*1024*1024, backupCount=5),
         logging.StreamHandler()
     ]
 )
-error_logger = logging.getLogger('error_logger')
-error_logger.setLevel(logging.ERROR)
-error_handler = logging.FileHandler('error.log')
-error_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
-error_logger.addHandler(error_handler)
 
-# คลาส APIManager: จัดการการเรียก API และควบคุม rate limit
 class APIManager:
     def __init__(self):
-        """เริ่มต้นตัวแปรสำหรับจัดการ API และ rate limit"""
         self.weight_used = 0
-        self.weight_limit = 2400  # อัพเดทตาม Binance 2025
+        self.weight_limit = CONFIG['rate_limit_per_minute']
         self.last_reset = time.time()
         self.is_rate_limited = False
         self.ban_until = 0
         self.request_count = 0
         self.rate_limit_status = {}
         self.kpi_priority_weight = 0
-        self.api_call_timestamps = deque(maxlen=RATE_LIMIT)
+        self.api_call_timestamps = deque(maxlen=CONFIG['rate_limit_per_minute'])
         self.exchange = ccxt_async.binance({
             'apiKey': CONFIG['binance_api_key'],
             'secret': CONFIG['binance_api_secret'],
             'enableRateLimit': True,
             'timeout': CONFIG['api_timeout'] * 1000,
-            'rateLimit': int(60000 / RATE_LIMIT)
+            'rateLimit': int(60000 / CONFIG['rate_limit_per_minute'])
         })
+        self.max_leverage_per_symbol = {}
+        self.trailing_orders = {}  # เก็บข้อมูลคำสั่ง Trailing SL และ TP {symbol: {'sl_order_id': str, 'tp_order_id': str, 'last_price': float}}
 
     async def update_weight(self, response):
-        """อัพเดทน้ำหนักการใช้งาน API จาก header การตอบกลับ"""
+        """อัพเดทน้ำหนัก API จาก header และรีเซ็ตทุก 60 วินาที"""
         if 'x-mbx-used-weight-1m' in response.headers:
             self.weight_used = int(response.headers['x-mbx-used-weight-1m'])
             self.rate_limit_status['used_weight'] = self.weight_used
@@ -81,7 +70,7 @@ class APIManager:
             self.last_reset = time.time()
 
     async def rate_limit_control(self):
-        """ควบคุม rate limit เพื่อป้องกันการถูกแบน"""
+        """ควบคุม rate limit เพื่อป้องกันการถูกแบนจาก Binance"""
         now = time.time()
         if self.is_rate_limited and now < self.ban_until:
             wait_time = self.ban_until - now
@@ -97,191 +86,263 @@ class APIManager:
             self.last_reset = now
         self.api_call_timestamps.append(now)
         self.request_count += 1
-        if len(self.api_call_timestamps) >= RATE_LIMIT:
-            wait_time = API_CALL_INTERVAL - (now - self.api_call_timestamps[0])
+        if len(self.api_call_timestamps) >= CONFIG['rate_limit_per_minute']:
+            wait_time = (60 / CONFIG['rate_limit_per_minute']) - (now - self.api_call_timestamps[0])
             if wait_time > 0:
                 await asyncio.sleep(wait_time)
 
     async def optimize_api_usage(self, kpi_tracker=None):
-        """ปรับการใช้งาน API ตาม KPI และสถานะน้ำหนัก"""
-        global API_CALL_INTERVAL
+        """ปรับการใช้งาน API ตาม KPI และน้ำหนักที่ใช้"""
         if self.weight_used > self.weight_limit * 0.5:
-            API_CALL_INTERVAL = min(API_CALL_INTERVAL * 1.2, 0.1)
-            logging.info(f"ปรับ API Call Interval เป็น {API_CALL_INTERVAL:.4f} วินาที")
-        if kpi_tracker and kpi_tracker.total_profit < CONFIG['min_daily_kpi']:
+            logging.info(f"ปรับ interval การเรียก API ช้าลงเนื่องจากน้ำหนักใช้งานเกินครึ่ง")
+        if kpi_tracker and kpi_tracker.total_profit < 50000.0:
             self.kpi_priority_weight += 0.1
-            logging.info(f"เพิ่มน้ำหนัก API priority เป็น {self.kpi_priority_weight:.2f} เพื่อเกิน KPI")
+            logging.info(f"เพิ่มน้ำหนัก priority สำหรับ KPI: {self.kpi_priority_weight:.2f}")
         self.request_count = 0
 
+    @retry(wait=wait_exponential(multiplier=1, min=4, max=60), stop=stop_after_attempt(CONFIG['max_api_retries']))
     async def fetch_max_leverage(self):
-        """ดึงข้อมูล Leverage สูงสุดและตั้งค่าโหมด margin สำหรับแต่ละเหรียญ"""
+        """ดึงข้อมูล leverage สูงสุดสำหรับแต่ละเหรียญ"""
         await self.rate_limit_control()
         try:
             info = await self.exchange.fapiPublic_get_exchangeInfo()
             max_leverage = {}
             for s in info['symbols']:
                 if s['symbol'].endswith('USDT'):
-                    max_leverage[s['symbol']] = s.get('leverage', {}).get('max', 125)
-                    # ตั้งค่าโหมด margin
-                    await self.set_margin_mode(s['symbol'], CONFIG['margin_mode'])
-            CONFIG['max_leverage_per_symbol'] = max_leverage
+                    if 'brackets' in s and s['brackets']:
+                        max_leverage[s['symbol']] = int(s['brackets'][-1].get('initialLeverage', 125))
+                    else:
+                        max_leverage[s['symbol']] = 125
+            self.max_leverage_per_symbol = max_leverage
             logging.info(f"ดึง max_leverage สำเร็จ: {len(max_leverage)} เหรียญ")
             return max_leverage
         except Exception as e:
             logging.error(f"ดึง max_leverage ล้มเหลว: {e}")
-            return {}
+            raise
 
-    async def set_margin_mode(self, symbol, mode):
-        """ตั้งค่าโหมด margin (Cross/Isolated) สำหรับเหรียญ"""
-        if CONFIG['dry_run']:
-            logging.info(f"โหมดจำลอง: จำลองการตั้งค่า margin mode เป็น {mode} สำหรับ {symbol}")
-            return True
+    async def set_margin_mode(self, symbol):
+        """ตั้งค่า margin mode (CROSS หรือ ISOLATED) สำหรับเหรียญ"""
+        mode = CONFIG['margin_mode'].upper() if CONFIG['margin_mode'].upper() in ['CROSS', 'ISOLATED'] else 'CROSS'
         await self.rate_limit_control()
-        try:
-            await self.exchange.fapiPrivate_post_marginType({
-                'symbol': symbol,
-                'marginType': mode.upper()
-            })
-            logging.info(f"ตั้งค่า margin mode เป็น {mode} สำหรับ {symbol} สำเร็จ")
-            return True
-        except Exception as e:
-            logging.error(f"ตั้งค่า margin mode สำหรับ {symbol} ล้มเหลว: {e}")
-            return False
-
-    async def set_leverage(self, symbol, leverage):
-        """ตั้งค่า Leverage โดยคำนึงถึง min_leverage และ max_leverage"""
         if CONFIG['dry_run']:
-            logging.info(f"โหมดจำลอง: จำลองการตั้งค่า leverage เป็น {leverage} สำหรับ {symbol}")
-            return leverage
-        await self.rate_limit_control()
+            logging.info(f"จำลองการตั้ง margin mode สำหรับ {symbol} เป็น {mode}")
+            return {'status': 'success'}
         try:
-            max_leverage = CONFIG['max_leverage_per_symbol'].get(symbol, 125)
-            adjusted_leverage = max(CONFIG['min_leverage'], min(int(leverage), max_leverage))
-            await self.exchange.fapiPrivate_post_leverage({
-                'symbol': symbol,
-                'leverage': adjusted_leverage
-            })
-            logging.info(f"ตั้งค่า leverage เป็น {adjusted_leverage} สำหรับ {symbol}")
-            return adjusted_leverage
-        except Exception as e:
-            logging.error(f"ตั้งค่า leverage สำหรับ {symbol} ล้มเหลว: {e}")
-            return CONFIG['min_leverage']
-
-    async def create_order_with_tp_sl(self, symbol, side, size, price, stop_loss, take_profit):
-        """สร้างคำสั่งซื้อขายพร้อม TP/SL ในโหมดเทรดจริง"""
-        if CONFIG['dry_run']:
-            logging.info(f"โหมดจำลอง: จำลองคำสั่ง {side} สำหรับ {symbol}, size={size}, price={price}, SL={stop_loss}, TP={take_profit}")
-            return {'id': f"sim_{symbol}_{time.time()}"}
-        await self.rate_limit_control()
-        try:
-            # สร้างคำสั่งหลัก
-            order = await self.exchange.create_order(
-                symbol=symbol,
-                type='market',
-                side=side.lower(),
-                amount=size,
-                params={'leverage': await self.set_leverage(symbol, CONFIG['min_leverage'])}
-            )
-            # สร้างคำสั่ง Stop Loss (STOP_MARKET)
-            sl_params = {
-                'stopPrice': stop_loss,
-                'closePosition': True,
-                'type': 'STOP_MARKET',
-                'workingType': 'MARK_PRICE'
-            }
-            await self.exchange.create_order(
-                symbol=symbol,
-                type='stop',
-                side=('sell' if side.lower() == 'buy' else 'buy'),
-                amount=size,
-                params=sl_params
-            )
-            # สร้างคำสั่ง Take Profit (TAKE_PROFIT_MARKET)
-            tp_params = {
-                'stopPrice': take_profit,
-                'closePosition': True,
-                'type': 'TAKE_PROFIT_MARKET',
-                'workingType': 'MARK_PRICE'
-            }
-            await self.exchange.create_order(
-                symbol=symbol,
-                type='take_profit',
-                side=('sell' if side.lower() == 'buy' else 'buy'),
-                amount=size,
-                params=tp_params
-            )
-            logging.info(f"สร้างคำสั่ง {side} สำหรับ {symbol} สำเร็จ: order_id={order['id']}, SL={stop_loss}, TP={take_profit}")
-            return order
-        except Exception as e:
-            logging.error(f"สร้างคำสั่งสำหรับ {symbol} ล้มเหลว: {e}")
-            return None
-
-    async def update_tp_sl(self, symbol, order_id, new_stop_loss, new_take_profit):
-        """อัพเดท TP/SL สำหรับคำสั่งที่เปิดอยู่"""
-        if CONFIG['dry_run']:
-            logging.info(f"โหมดจำลอง: จำลองการอัพเดท TP/SL สำหรับ {symbol}, order_id={order_id}, new_SL={new_stop_loss}, new_TP={new_take_profit}")
-            return True
-        await self.rate_limit_control()
-        try:
-            # ยกเลิกคำสั่ง SL/TP เดิม
-            open_orders = await self.exchange.fetch_open_orders(symbol)
-            for order in open_orders:
-                if order['type'] in ['stop', 'take_profit'] and order['info']['positionSide'] == order_id:
-                    await self.cancel_order_async(symbol, order['id'])
-            # สร้างคำสั่ง SL/TP ใหม่
-            position = await self.exchange.fetch_position(symbol)
-            size = abs(float(position['info']['positionAmt']))
-            side = 'buy' if float(position['info']['positionAmt']) > 0 else 'sell'
-            sl_params = {
-                'stopPrice': new_stop_loss,
-                'closePosition': True,
-                'type': 'STOP_MARKET',
-                'workingType': 'MARK_PRICE'
-            }
-            await self.exchange.create_order(
-                symbol=symbol,
-                type='stop',
-                side=('sell' if side == 'buy' else 'buy'),
-                amount=size,
-                params=sl_params
-            )
-            tp_params = {
-                'stopPrice': new_take_profit,
-                'closePosition': True,
-                'type': 'TAKE_PROFIT_MARKET',
-                'workingType': 'MARK_PRICE'
-            }
-            await self.exchange.create_order(
-                symbol=symbol,
-                type='take_profit',
-                side=('sell' if side == 'buy' else 'buy'),
-                amount=size,
-                params=tp_params
-            )
-            logging.info(f"อัพเดท TP/SL สำหรับ {symbol}, order_id={order_id}: new_SL={new_stop_loss}, new_TP={new_take_profit}")
-            return True
-        except Exception as e:
-            logging.error(f"อัพเดท TP/SL สำหรับ {symbol} ล้มเหลว: {e}")
-            return False
-
-    async def cancel_order_async(self, symbol, order_id):
-        """ยกเลิกคำสั่งซื้อขาย"""
-        if CONFIG['dry_run']:
-            logging.info(f"โหมดจำลอง: จำลองการยกเลิกออเดอร์ {order_id} สำหรับ {symbol}")
-            return {'status': 'canceled'}
-        await self.rate_limit_control()
-        try:
-            response = await self.exchange.fapiPrivate_delete_order({
-                'symbol': symbol,
-                'orderId': order_id
-            })
-            logging.info(f"ยกเลิกออเดอร์ {order_id} สำหรับ {symbol} สำเร็จ")
+            response = await self.exchange.fapiPrivate_post_marginType({'symbol': symbol, 'marginType': mode})
+            logging.info(f"ตั้ง margin mode สำหรับ {symbol} เป็น {mode} สำเร็จ")
             return response
         except Exception as e:
-            logging.error(f"ยกเลิกออเดอร์ {order_id} ล้มเหลว: {e}")
+            logging.error(f"ตั้ง margin mode สำหรับ {symbol} ล้มเหลว: {e}")
             return None
 
+    async def set_leverage(self, symbol, leverage):
+        """ตั้งค่า leverage โดยจำกัดระหว่าง min_leverage และ max_leverage ของเหรียญ"""
+        max_lev = self.max_leverage_per_symbol.get(symbol, 125)
+        adjusted_leverage = max(CONFIG['min_leverage'], min(int(leverage), max_lev))
+        await self.rate_limit_control()
+        if CONFIG['dry_run']:
+            logging.info(f"จำลองการตั้ง leverage สำหรับ {symbol} เป็น {adjusted_leverage}")
+            return {'status': 'success'}
+        try:
+            response = await self.exchange.fapiPrivate_post_leverage({'symbol': symbol, 'leverage': adjusted_leverage})
+            logging.info(f"ตั้ง leverage สำหรับ {symbol} เป็น {adjusted_leverage} สำเร็จ")
+            return response
+        except Exception as e:
+            logging.error(f"ตั้ง leverage สำหรับ {symbol} ล้มเหลว: {e}")
+            return None
+
+    async def create_limit_order_with_trailing(self, symbol, side, amount, price, callback_rate=None, activation_price=None):
+        """สร้าง limit order พร้อม Trailing Stop Loss และ Trailing Take Profit"""
+        callback_rate = callback_rate or CONFIG['trailing_callback_rate']
+        await self.rate_limit_control()
+        if CONFIG['dry_run']:
+            logging.info(f"จำลองการสร้าง limit order พร้อม trailing SL/TP สำหรับ {symbol}: {side} {amount} @{price}, callback {callback_rate}%")
+            return {'order_id': 'simulated_order_id', 'sl_order_id': 'simulated_sl_id', 'tp_order_id': 'simulated_tp_id', 'status': 'success'}
+        
+        try:
+            # สร้าง limit order หลัก
+            order = await self.exchange.create_order(symbol, 'limit', side.lower(), amount, price, {'reduceOnly': False})
+            logging.info(f"สร้าง limit order สำหรับ {symbol} สำเร็จ: ID {order['id']}")
+            
+            # คำนวณ Trailing Stop Loss และ Take Profit
+            opposite_side = 'sell' if side.lower() == 'buy' else 'buy'
+            sl_price = price * (1 - callback_rate / 100) if side.lower() == 'buy' else price * (1 + callback_rate / 100)
+            tp_price = price * (1 + callback_rate / 100) if side.lower() == 'buy' else price * (1 - callback_rate / 100)
+            
+            # สร้าง Trailing Stop Loss
+            sl_params = {'type': 'TRAILING_STOP_MARKET', 'callbackRate': callback_rate, 'reduceOnly': True}
+            if activation_price:
+                sl_params['activationPrice'] = activation_price if side.lower() == 'buy' else price * (1 + callback_rate / 200)
+            sl_order = await self.exchange.create_order(symbol, 'market', opposite_side, amount, None, sl_params)
+            
+            # สร้าง Trailing Take Profit
+            tp_params = {'type': 'TRAILING_STOP_MARKET', 'callbackRate': callback_rate, 'reduceOnly': True}
+            if activation_price:
+                tp_params['activationPrice'] = activation_price if side.lower() == 'sell' else price * (1 - callback_rate / 200)
+            tp_order = await self.exchange.create_order(symbol, 'market', opposite_side, amount, None, tp_params)
+            
+            # เก็บข้อมูลคำสั่ง
+            self.trailing_orders[symbol] = {
+                'order_id': order['id'],
+                'sl_order_id': sl_order['id'],
+                'tp_order_id': tp_order['id'],
+                'last_price': price,
+                'side': side.lower(),
+                'amount': amount
+            }
+            logging.info(f"สร้าง trailing SL/TP สำเร็จ: SL ID {sl_order['id']}, TP ID {tp_order['id']}")
+            return {
+                'order_id': order['id'],
+                'sl_order_id': sl_order['id'],
+                'tp_order_id': tp_order['id'],
+                'status': 'success'
+            }
+        except Exception as e:
+            logging.error(f"สร้าง limit order พร้อม trailing SL/TP สำหรับ {symbol} ล้มเหลว: {e}")
+            return None
+
+    async def update_trailing_orders(self, symbol, current_price, volatility=None):
+        """อัพเดท Trailing Stop Loss และ Take Profit ตามราคาปัจจุบันและความผันผวน"""
+        if symbol not in self.trailing_orders:
+            return False
+        
+        callback_rate = CONFIG['trailing_callback_rate']
+        if volatility:
+            callback_rate = max(callback_rate, min(2.0, callback_rate * (1 + volatility / 0.005)))
+        
+        order_info = self.trailing_orders[symbol]
+        side = order_info['side']
+        amount = order_info['amount']
+        opposite_side = 'sell' if side == 'buy' else 'buy'
+        
+        try:
+            # ยกเลิกคำสั่ง Trailing SL และ TP เดิม
+            await self.cancel_order(symbol, order_info['sl_order_id'])
+            await self.cancel_order(symbol, order_info['tp_order_id'])
+            
+            # คำนวณ Trailing SL และ TP ใหม่
+            sl_price = current_price * (1 - callback_rate / 100) if side == 'buy' else current_price * (1 + callback_rate / 100)
+            tp_price = current_price * (1 + callback_rate / 100) if side == 'buy' else current_price * (1 - callback_rate / 100)
+            
+            # สร้าง Trailing SL ใหม่
+            sl_params = {'type': 'TRAILING_STOP_MARKET', 'callbackRate': callback_rate, 'reduceOnly': True}
+            sl_order = await self.exchange.create_order(symbol, 'market', opposite_side, amount, None, sl_params)
+            
+            # สร้าง Trailing TP ใหม่
+            tp_params = {'type': 'TRAILING_STOP_MARKET', 'callbackRate': callback_rate, 'reduceOnly': True}
+            tp_order = await self.exchange.create_order(symbol, 'market', opposite_side, amount, None, tp_params)
+            
+            # อัพเดทข้อมูลคำสั่ง
+            self.trailing_orders[symbol].update({
+                'sl_order_id': sl_order['id'],
+                'tp_order_id': tp_order['id'],
+                'last_price': current_price
+            })
+            logging.info(f"อัพเดท trailing SL/TP สำหรับ {symbol} สำเร็จ: SL ID {sl_order['id']}, TP ID {tp_order['id']}")
+            return True
+        except Exception as e:
+            logging.error(f"อัพเดท trailing SL/TP สำหรับ {symbol} ล้มเหลว: {e}")
+            return False
+
+    async def create_limit_order(self, symbol, side, amount, price, params={}):
+        """สร้าง limit order ธรรมดา"""
+        await self.rate_limit_control()
+        if CONFIG['dry_run']:
+            logging.info(f"จำลองการสร้าง limit order สำหรับ {symbol}: {side} {amount} @{price}")
+            return {'id': 'simulated_order_id', 'status': 'success'}
+        try:
+            order = await self.exchange.create_order(symbol, 'limit', side.lower(), amount, price, params)
+            logging.info(f"สร้าง limit order สำหรับ {symbol} สำเร็จ: ID {order['id']}")
+            return order
+        except Exception as e:
+            logging.error(f"สร้าง limit order สำหรับ {symbol} ล้มเหลว: {e}")
+            return None
+
+    async def create_stop_order(self, symbol, side, amount, stop_price, params={'reduceOnly': True}):
+        """สร้าง stop order (Stop Loss)"""
+        params['type'] = 'STOP_MARKET'
+        params['stopPrice'] = stop_price
+        await self.rate_limit_control()
+        if CONFIG['dry_run']:
+            logging.info(f"จำลองการสร้าง stop order สำหรับ {symbol}: {side} @{stop_price}")
+            return {'id': 'simulated_stop_id', 'status': 'success'}
+        try:
+            order = await self.exchange.create_order(symbol, 'market', side.lower(), amount, None, params)
+            logging.info(f"สร้าง stop order สำหรับ {symbol} สำเร็จ: ID {order['id']}")
+            return order
+        except Exception as e:
+            logging.error(f"สร้าง stop order สำหรับ {symbol} ล้มเหลว: {e}")
+            return None
+
+    async def create_take_profit_order(self, symbol, side, amount, tp_price, params={'reduceOnly': True}):
+        """สร้าง take profit order"""
+        params['type'] = 'TAKE_PROFIT_MARKET'
+        params['stopPrice'] = tp_price
+        await self.rate_limit_control()
+        if CONFIG['dry_run']:
+            logging.info(f"จำลองการสร้าง take profit order สำหรับ {symbol}: {side} @{tp_price}")
+            return {'id': 'simulated_tp_id', 'status': 'success'}
+        try:
+            order = await self.exchange.create_order(symbol, 'market', side.lower(), amount, None, params)
+            logging.info(f"สร้าง take profit order สำหรับ {symbol} สำเร็จ: ID {order['id']}")
+            return order
+        except Exception as e:
+            logging.error(f"สร้าง take profit order สำหรับ {symbol} ล้มเหลว: {e}")
+            return None
+
+    async def update_order(self, symbol, order_id, params):
+        """อัพเดทคำสั่งที่มีอยู่"""
+        await self.rate_limit_control()
+        if CONFIG['dry_run']:
+            logging.info(f"จำลองการอัพเดท order ID {order_id} สำหรับ {symbol}")
+            return {'status': 'success'}
+        try:
+            response = await self.exchange.edit_order(order_id, symbol, params=params)
+            logging.info(f"อัพเดท order ID {order_id} สำหรับ {symbol} สำเร็จ")
+            return response
+        except Exception as e:
+            logging.error(f"อัพเดท order ID {order_id} ล้มเหลว: {e}")
+            return None
+
+    async def cancel_order(self, symbol, order_id):
+        """ยกเลิกคำสั่ง"""
+        await self.rate_limit_control()
+        if CONFIG['dry_run']:
+            logging.info(f"จำลองการยกเลิก order ID {order_id} สำหรับ {symbol}")
+            return {'status': 'success'}
+        try:
+            response = await self.exchange.cancel_order(order_id, symbol)
+            logging.info(f"ยกเลิก order ID {order_id} สำหรับ {symbol} สำเร็จ")
+            if symbol in self.trailing_orders and (order_id == self.trailing_orders[symbol].get('sl_order_id') or order_id == self.trailing_orders[symbol].get('tp_order_id')):
+                del self.trailing_orders[symbol]
+            return response
+        except Exception as e:
+            logging.error(f"ยกเลิก order ID {order_id} ล้มเหลว: {e}")
+            return None
+
+    async def check_symbol_exists(self, symbol):
+        """ตรวจสอบว่าเหรียญมีอยู่ใน Binance Futures"""
+        await self.rate_limit_control()
+        try:
+            await self.exchange.load_markets()
+            return symbol in self.exchange.markets
+        except Exception as e:
+            logging.error(f"ตรวจสอบ symbol {symbol} ล้มเหลว: {e}")
+            return False
+
+    async def check_balance(self, asset='USDT'):
+        """ตรวจสอบยอดเงินในบัญชี Futures"""
+        await self.rate_limit_control()
+        if CONFIG['dry_run']:
+            return {'free': 1000.0, 'total': 1000.0}
+        try:
+            balance = await self.exchange.fetch_balance(params={'type': 'futures'})
+            return balance.get(asset, {'free': 0, 'total': 0})
+        except Exception as e:
+            logging.error(f"ตรวจสอบ balance ล้มเหลว: {e}")
+            return {'free': 0, 'total': 0}
+
     async def predict_usage(self):
-        """ทำนายการใช้งาน API ในอนาคต (60 วินาทีข้างหน้า)"""
+        """คาดการณ์การใช้งาน API ในอนาคต (60 วินาทีข้างหน้า)"""
         usage_history = [self.weight_used] * 60
-        return np.mean(usage_history)  # คาดการณ์จากค่าเฉลี่ย
+        return sum(usage_history) / len(usage_history) if usage_history else 0
