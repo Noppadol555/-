@@ -11,7 +11,7 @@ import ccxt.async_support as ccxt_async
 from tenacity import retry, wait_exponential, stop_after_attempt
 
 # คอนฟิกเฉพาะสำหรับคลาส APIManager
-# การใช้งาน: ปรับค่าในนี้เพื่อควบคุมพฤติกรรม เช่น rate limit, timeout, หรือโหมด margin
+# การใช้งาน: ปรับค่าในนี้เพื่อควบคุมพฤติกรรม เช่น rate limit, timeout, margin mode, หรือการซิงค์เวลา
 CONFIG = {
     'binance_api_key': 'YOUR_API_KEY_HERE',  # คีย์ API สำหรับเชื่อมต่อ Binance Futures
     'binance_api_secret': 'YOUR_API_SECRET_HERE',  # รหัสลับ API สำหรับ Binance Futures
@@ -23,7 +23,8 @@ CONFIG = {
     'margin_mode': 'cross',  # โหมด margin ('cross' หรือ 'isolated')
     'min_leverage': 5,  # Leverage ขั้นต่ำที่ยอมรับ
     'trailing_callback_rate': 0.5,  # เปอร์เซ็นต์ callback สำหรับ Trailing Stop และ Take Profit (0.5%)
-    'trailing_update_interval': 60  # ระยะเวลา (วินาที) สำหรับการอัพเดท Trailing SL/TP อัตโนมัติ
+    'trailing_update_interval': 60,  # ระยะเวลา (วินาที) สำหรับการอัพเดท Trailing SL/TP อัตโนมัติ
+    'sync_time_interval': 3600  # ระยะเวลา (วินาที) สำหรับการซิงค์เวลากับเซิร์ฟเวอร์ Binance
 }
 
 # การตั้งค่าระบบบันทึก log เฉพาะสำหรับคลาสนี้
@@ -47,6 +48,8 @@ class APIManager:
         self.rate_limit_status = {}
         self.kpi_priority_weight = 0
         self.api_call_timestamps = deque(maxlen=CONFIG['rate_limit_per_minute'])
+        self.time_offset = 0  # ความแตกต่างของเวลาระหว่างเครื่องท้องถิ่นและเซิร์ฟเวอร์ Binance (มิลลิวินาที)
+        self.last_time_sync = 0  # เวลาที่ซิงค์ล่าสุด
         self.exchange = ccxt_async.binance({
             'apiKey': CONFIG['binance_api_key'],
             'secret': CONFIG['binance_api_secret'],
@@ -56,6 +59,30 @@ class APIManager:
         })
         self.max_leverage_per_symbol = {}
         self.trailing_orders = {}  # เก็บข้อมูลคำสั่ง Trailing SL และ TP {symbol: {'sl_order_id': str, 'tp_order_id': str, 'last_price': float}}
+
+    async def sync_time_with_exchange(self):
+        """ซิงโครไนซ์เวลากับเซิร์ฟเวอร์ Binance เพื่อคำนวณ timeOffset"""
+        await self.rate_limit_control()
+        if CONFIG['dry_run']:
+            logging.info("จำลองการซิงค์เวลา: timeOffset = 0")
+            self.time_offset = 0
+            self.last_time_sync = time.time()
+            return True
+        try:
+            server_time = await self.exchange.fetch_time()
+            local_time = int(time.time() * 1000)  # แปลงเป็นมิลลิวินาที
+            self.time_offset = server_time - local_time
+            self.last_time_sync = time.time()
+            logging.info(f"ซิงค์เวลาสำเร็จ: timeOffset = {self.time_offset} มิลลิวินาที")
+            return True
+        except Exception as e:
+            logging.error(f"ซิงค์เวลาล้มเหลว: {e}")
+            self.time_offset = 0
+            return False
+
+    async def get_adjusted_timestamp(self):
+        """คืนค่า timestamp ที่ปรับตาม timeOffset (มิลลิวินาที)"""
+        return int(time.time() * 1000) + self.time_offset
 
     async def update_weight(self, response):
         """อัพเดทน้ำหนัก API จาก header และรีเซ็ตทุก 60 วินาที"""
@@ -72,6 +99,9 @@ class APIManager:
     async def rate_limit_control(self):
         """ควบคุม rate limit เพื่อป้องกันการถูกแบนจาก Binance"""
         now = time.time()
+        # ตรวจสอบและซิงค์เวลาหากเกินระยะเวลา sync_time_interval
+        if now - self.last_time_sync >= CONFIG['sync_time_interval']:
+            await self.sync_time_with_exchange()
         if self.is_rate_limited and now < self.ban_until:
             wait_time = self.ban_until - now
             logging.warning(f"ถูกจำกัด IP รอ {wait_time:.2f} วินาที")
@@ -105,7 +135,7 @@ class APIManager:
         """ดึงข้อมูล leverage สูงสุดสำหรับแต่ละเหรียญ"""
         await self.rate_limit_control()
         try:
-            info = await self.exchange.fapiPublic_get_exchangeInfo()
+            info = await self.exchange.fapiPublic_get_exchangeInfo(params={'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()})
             max_leverage = {}
             for s in info['symbols']:
                 if s['symbol'].endswith('USDT'):
@@ -128,7 +158,7 @@ class APIManager:
             logging.info(f"จำลองการตั้ง margin mode สำหรับ {symbol} เป็น {mode}")
             return {'status': 'success'}
         try:
-            response = await self.exchange.fapiPrivate_post_marginType({'symbol': symbol, 'marginType': mode})
+            response = await self.exchange.fapiPrivate_post_marginType({'symbol': symbol, 'marginType': mode, 'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()})
             logging.info(f"ตั้ง margin mode สำหรับ {symbol} เป็น {mode} สำเร็จ")
             return response
         except Exception as e:
@@ -144,7 +174,7 @@ class APIManager:
             logging.info(f"จำลองการตั้ง leverage สำหรับ {symbol} เป็น {adjusted_leverage}")
             return {'status': 'success'}
         try:
-            response = await self.exchange.fapiPrivate_post_leverage({'symbol': symbol, 'leverage': adjusted_leverage})
+            response = await self.exchange.fapiPrivate_post_leverage({'symbol': symbol, 'leverage': adjusted_leverage, 'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()})
             logging.info(f"ตั้ง leverage สำหรับ {symbol} เป็น {adjusted_leverage} สำเร็จ")
             return response
         except Exception as e:
@@ -161,7 +191,7 @@ class APIManager:
         
         try:
             # สร้าง limit order หลัก
-            order = await self.exchange.create_order(symbol, 'limit', side.lower(), amount, price, {'reduceOnly': False})
+            order = await self.exchange.create_order(symbol, 'limit', side.lower(), amount, price, {'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()})
             logging.info(f"สร้าง limit order สำหรับ {symbol} สำเร็จ: ID {order['id']}")
             
             # คำนวณ Trailing Stop Loss และ Take Profit
@@ -173,13 +203,13 @@ class APIManager:
             sl_params = {'type': 'TRAILING_STOP_MARKET', 'callbackRate': callback_rate, 'reduceOnly': True}
             if activation_price:
                 sl_params['activationPrice'] = activation_price if side.lower() == 'buy' else price * (1 + callback_rate / 200)
-            sl_order = await self.exchange.create_order(symbol, 'market', opposite_side, amount, None, sl_params)
+            sl_order = await self.exchange.create_order(symbol, 'market', opposite_side, amount, None, {**sl_params, 'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()})
             
             # สร้าง Trailing Take Profit
             tp_params = {'type': 'TRAILING_STOP_MARKET', 'callbackRate': callback_rate, 'reduceOnly': True}
             if activation_price:
                 tp_params['activationPrice'] = activation_price if side.lower() == 'sell' else price * (1 - callback_rate / 200)
-            tp_order = await self.exchange.create_order(symbol, 'market', opposite_side, amount, None, tp_params)
+            tp_order = await self.exchange.create_order(symbol, 'market', opposite_side, amount, None, {**tp_params, 'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()})
             
             # เก็บข้อมูลคำสั่ง
             self.trailing_orders[symbol] = {
@@ -226,11 +256,11 @@ class APIManager:
             
             # สร้าง Trailing SL ใหม่
             sl_params = {'type': 'TRAILING_STOP_MARKET', 'callbackRate': callback_rate, 'reduceOnly': True}
-            sl_order = await self.exchange.create_order(symbol, 'market', opposite_side, amount, None, sl_params)
+            sl_order = await self.exchange.create_order(symbol, 'market', opposite_side, amount, None, {**sl_params, 'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()})
             
             # สร้าง Trailing TP ใหม่
             tp_params = {'type': 'TRAILING_STOP_MARKET', 'callbackRate': callback_rate, 'reduceOnly': True}
-            tp_order = await self.exchange.create_order(symbol, 'market', opposite_side, amount, None, tp_params)
+            tp_order = await self.exchange.create_order(symbol, 'market', opposite_side, amount, None, {**tp_params, 'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()})
             
             # อัพเดทข้อมูลคำสั่ง
             self.trailing_orders[symbol].update({
@@ -251,7 +281,7 @@ class APIManager:
             logging.info(f"จำลองการสร้าง limit order สำหรับ {symbol}: {side} {amount} @{price}")
             return {'id': 'simulated_order_id', 'status': 'success'}
         try:
-            order = await self.exchange.create_order(symbol, 'limit', side.lower(), amount, price, params)
+            order = await self.exchange.create_order(symbol, 'limit', side.lower(), amount, price, {**params, 'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()})
             logging.info(f"สร้าง limit order สำหรับ {symbol} สำเร็จ: ID {order['id']}")
             return order
         except Exception as e:
@@ -267,7 +297,7 @@ class APIManager:
             logging.info(f"จำลองการสร้าง stop order สำหรับ {symbol}: {side} @{stop_price}")
             return {'id': 'simulated_stop_id', 'status': 'success'}
         try:
-            order = await self.exchange.create_order(symbol, 'market', side.lower(), amount, None, params)
+            order = await self.exchange.create_order(symbol, 'market', side.lower(), amount, None, {**params, 'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()})
             logging.info(f"สร้าง stop order สำหรับ {symbol} สำเร็จ: ID {order['id']}")
             return order
         except Exception as e:
@@ -283,7 +313,7 @@ class APIManager:
             logging.info(f"จำลองการสร้าง take profit order สำหรับ {symbol}: {side} @{tp_price}")
             return {'id': 'simulated_tp_id', 'status': 'success'}
         try:
-            order = await self.exchange.create_order(symbol, 'market', side.lower(), amount, None, params)
+            order = await self.exchange.create_order(symbol, 'market', side.lower(), amount, None, {**params, 'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()})
             logging.info(f"สร้าง take profit order สำหรับ {symbol} สำเร็จ: ID {order['id']}")
             return order
         except Exception as e:
@@ -297,7 +327,7 @@ class APIManager:
             logging.info(f"จำลองการอัพเดท order ID {order_id} สำหรับ {symbol}")
             return {'status': 'success'}
         try:
-            response = await self.exchange.edit_order(order_id, symbol, params=params)
+            response = await self.exchange.edit_order(order_id, symbol, {**params, 'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()})
             logging.info(f"อัพเดท order ID {order_id} สำหรับ {symbol} สำเร็จ")
             return response
         except Exception as e:
@@ -311,7 +341,7 @@ class APIManager:
             logging.info(f"จำลองการยกเลิก order ID {order_id} สำหรับ {symbol}")
             return {'status': 'success'}
         try:
-            response = await self.exchange.cancel_order(order_id, symbol)
+            response = await self.exchange.cancel_order(order_id, symbol, {'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()})
             logging.info(f"ยกเลิก order ID {order_id} สำหรับ {symbol} สำเร็จ")
             if symbol in self.trailing_orders and (order_id == self.trailing_orders[symbol].get('sl_order_id') or order_id == self.trailing_orders[symbol].get('tp_order_id')):
                 del self.trailing_orders[symbol]
@@ -324,7 +354,7 @@ class APIManager:
         """ตรวจสอบว่าเหรียญมีอยู่ใน Binance Futures"""
         await self.rate_limit_control()
         try:
-            await self.exchange.load_markets()
+            await self.exchange.load_markets(params={'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()})
             return symbol in self.exchange.markets
         except Exception as e:
             logging.error(f"ตรวจสอบ symbol {symbol} ล้มเหลว: {e}")
@@ -336,7 +366,7 @@ class APIManager:
         if CONFIG['dry_run']:
             return {'free': 1000.0, 'total': 1000.0}
         try:
-            balance = await self.exchange.fetch_balance(params={'type': 'futures'})
+            balance = await self.exchange.fetch_balance(params={'type': 'futures', 'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()})
             return balance.get(asset, {'free': 0, 'total': 0})
         except Exception as e:
             logging.error(f"ตรวจสอบ balance ล้มเหลว: {e}")
