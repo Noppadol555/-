@@ -1,0 +1,91 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import random
+
+# CONFIG สำหรับ EvoGAN (จากต้นฉบับ: ใช้สำหรับ Neural Architecture Search)
+CONFIG = {
+    'nas_iterations': 100  # จำนวน iterations สำหรับ Neural Architecture Search
+}
+
+# กำหนด TIMESTEPS จากต้นฉบับ (ใช้ใน input shape)
+TIMESTEPS = 10
+
+class EvoGAN:
+    def __init__(self, input_dim, action_space_size):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.generator = nn.Sequential(
+            nn.Linear(input_dim * TIMESTEPS, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, action_space_size),
+            nn.Softmax(dim=-1)
+        ).to(self.device)
+        self.discriminator = nn.Sequential(
+            nn.Linear(action_space_size, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        ).to(self.device)
+        self.gen_optimizer = torch.optim.Adam(self.generator.parameters(), lr=0.0001, weight_decay=0.01)
+        self.disc_optimizer = torch.optim.Adam(self.discriminator.parameters(), lr=0.0001, weight_decay=0.01)
+        self.evo_population = []
+        self.strategy_confidence = {}
+
+    def generate(self, state):
+        state = torch.FloatTensor(state).to(self.device)
+        strategy = self.generator(state.view(-1, TIMESTEPS * state.shape[-1]))
+        confidence = self.discriminator(strategy).mean().item()
+        self.strategy_confidence[tuple(strategy.cpu().detach().numpy()[0])] = confidence
+        return strategy
+
+    def train(self, real_strategies, fake_strategies):
+        real_strategies = torch.FloatTensor(real_strategies).to(self.device)
+        fake_strategies = torch.FloatTensor(fake_strategies).to(self.device)
+        real_labels = torch.ones(real_strategies.size(0), 1).to(self.device)
+        fake_labels = torch.zeros(fake_strategies.size(0), 1).to(self.device)
+        self.disc_optimizer.zero_grad()
+        real_loss = nn.BCELoss()(self.discriminator(real_strategies), real_labels)
+        fake_loss = nn.BCELoss()(self.discriminator(fake_strategies.detach()), fake_labels)
+        disc_loss = (real_loss + fake_loss) / 2
+        disc_loss.backward()
+        self.disc_optimizer.step()
+        self.gen_optimizer.zero_grad()
+        gen_loss = nn.BCELoss()(self.discriminator(fake_strategies), real_labels)
+        gen_loss.backward()
+        self.gen_optimizer.step()
+        return disc_loss.item(), gen_loss.item()
+
+    def evolve(self, strategies, rewards):
+        self.evo_population = sorted(zip(strategies, rewards), key=lambda x: x[1], reverse=True)[:10]
+        for _ in range(5):
+            indices = np.random.choice(range(len(self.evo_population[:5])), 2, replace=False)
+            parent1 = self.evo_population[indices[0]][0]
+            parent2 = self.evo_population[indices[1]][0]
+            child = (parent1 + parent2) / 2 + np.random.normal(0, 0.01, size=parent1.shape)
+            self.evo_population.append((child, 0))
+        return [p[0] for p in self.evo_population[:10]]
+
+    def search_architecture(self, state_dim, action_dim):
+        population = self._generate_initial_population()
+        for _ in range(CONFIG['nas_iterations']):
+            fitness = self._evaluate_population(population)
+            population = self._evolve_population(population, fitness)
+        return population[0]  # โมเดลที่ดีที่สุด
+
+    def _generate_initial_population(self):
+        return [self.generator.state_dict() for _ in range(10)]
+
+    def _evaluate_population(self, population):
+        return [random.random() for _ in population]
+
+    def _evolve_population(self, population, fitness):
+        sorted_pop = [p for _, p in sorted(zip(fitness, population), reverse=True)]
+        return sorted_pop[:10]
