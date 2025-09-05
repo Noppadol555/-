@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
+from collections import deque
 import random
 
 # CONFIG สำหรับ EvoGAN (จากต้นฉบับ: ใช้สำหรับ Neural Architecture Search)
