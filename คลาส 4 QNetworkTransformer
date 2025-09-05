@@ -1,0 +1,243 @@
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install torch transformers
+
+import torch
+import torch.nn as nn
+from transformers import GPT2Model, GPT2Config
+from collections import deque
+import logging
+import logging.handlers
+import math
+
+# การตั้งค่าระบบบันทึก log เฉพาะสำหรับคลาสนี้
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.handlers.RotatingFileHandler('qnetworktransformer.log', maxBytes=10*1024*1024, backupCount=5),
+        logging.StreamHandler()
+    ]
+)
+
+class QNetworkTransformer(nn.Module):
+    def __init__(self, input_dim, action_space_size, timesteps=10):
+        """เริ่มต้น QNetworkTransformer
+        Args:
+            input_dim (int): ขนาดของ state vector (เช่น จำนวน indicator)
+            action_space_size (int): จำนวน actions ที่เป็นไปได้ (เช่น buy, sell, hold)
+            timesteps (int, optional): จำนวน timesteps สำหรับ input (default: 10)
+        """
+        super(QNetworkTransformer, self).__init__()
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.input_dim = input_dim
+        self.action_space_size = action_space_size
+        self.timesteps = timesteps
+
+        # ตรวจสอบความถูกต้องของ input
+        if input_dim <= 0 or action_space_size <= 0 or timesteps <= 0:
+            logging.error(f"input_dim ({input_dim}), action_space_size ({action_space_size}), หรือ timesteps ({timesteps}) ต้องมากกว่า 0")
+            raise ValueError("input_dim, action_space_size, และ timesteps ต้องมากกว่า 0")
+
+        # ปรับขนาดโมเดลอัตโนมัติ
+        self.n_embd = min(128, max(64, input_dim * 2))  # ปรับ n_embd ตาม input_dim
+        self.n_layer = 4 if input_dim > 50 else 2  # ลด layer หาก input_dim เล็ก
+        self.n_head = 8 if input_dim > 50 else 4  # ลด head หาก input_dim เล็ก
+        self.dropout_rate = 0.1 if input_dim > 100 else 0.05  # ลด dropout หากโมเดลเล็ก
+        self.learning_rate = 0.0001 if input_dim > 50 else 0.0005  # ปรับ learning rate ตามขนาดโมเดล
+        self.gamma = 0.99  # Discount factor
+        self.epsilon = 0.1  # Exploration rate
+        self.confidence_window = 50  # ขนาด window สำหรับ confidence
+
+        # สร้าง GPT2 configuration
+        config = GPT2Config(
+            n_embd=self.n_embd,
+            n_layer=self.n_layer,
+            n_head=self.n_head,
+            n_positions=self.timesteps
+        )
+
+        # สร้างชั้น neural network
+        self.transformer = GPT2Model(config)
+        self.fc1 = nn.Linear(input_dim, self.n_embd)  # ปรับ input ให้เข้ากับ transformer
+        self.dropout1 = nn.Dropout(self.dropout_rate)
+        self.fc2 = nn.Linear(self.n_embd * self.timesteps + self.n_embd, 128)
+        self.dropout2 = nn.Dropout(self.dropout_rate)
+        self.q_output = nn.Linear(128, action_space_size)
+
+        # Optimizer
+        self.optimizer = torch.optim.Adam(
+            self.parameters(),
+            lr=self.learning_rate,
+            weight_decay=0.01
+        )
+
+        # เก็บ confidence history และ loss history
+        self.confidence = deque(maxlen=self.confidence_window)
+        self.loss_history = deque(maxlen=100)  # เก็บ loss ล่าสุด 100 ค่า
+
+        # ย้ายโมเดลไปยัง device
+        self.to(self.device)
+        logging.info(f"เริ่มต้น QNetworkTransformer: input_dim={input_dim}, action_space_size={action_space_size}, timesteps={timesteps}, device={self.device}")
+
+    def forward(self, x):
+        """Forward pass สำหรับทำนาย Q-values
+        Args:
+            x (torch.Tensor): Input tensor shape [batch_size, timesteps, input_dim]
+        Returns:
+            torch.Tensor: Q-values สำหรับแต่ละ action shape [batch_size, action_space_size]
+        """
+        # ตรวจสอบ input shape
+        if x.dim() != 3 or x.size(1) != self.timesteps or x.size(2) != self.input_dim:
+            logging.error(f"Input shape ไม่ถูกต้อง: ได้ {x.shape}, คาดหวัง [batch_size, {self.timesteps}, {self.input_dim}]")
+            raise ValueError(f"Input shape ต้องเป็น [batch_size, {self.timesteps}, {self.input_dim}]")
+
+        batch_size = x.size(0)
+        x = x.to(self.device)
+
+        # ปรับ input ให้เข้ากับ transformer
+        x = torch.relu(self.fc1(x))  # [batch_size, timesteps, n_embd]
+        x = self.dropout1(x)
+
+        # ส่งผ่าน transformer
+        transformer_out = self.transformer(inputs_embeds=x).last_hidden_state  # [batch_size, timesteps, n_embd]
+
+        # รวมกับ fully connected layer
+        flat_x = transformer_out.view(batch_size, -1)  # [batch_size, timesteps * n_embd]
+        transformer_last = transformer_out[:, -1, :]  # [batch_size, n_embd]
+        combined = torch.cat((flat_x, transformer_last), dim=1)  # [batch_size, tim timesteps * n_embd + n_embd]
+        fc2_out = torch.relu(self.fc2(combined))  # [batch_size, 128]
+        fc2_out = self.dropout2(fc2_out)
+        q_values = self.q_output(fc2_out)  # [batch_size, action_space_size]
+
+        return q_values
+
+    def train_step(self, states, actions, rewards, next_states, dones):
+        """ฝึกโมเดลด้วย batch ของ states, actions, rewards, next_states, และ dones
+        Args:
+            states (torch.Tensor): States shape [batch_size, timesteps, input_dim]
+            actions (torch.Tensor): Action indices shape [batch_size]
+            rewards (torch.Tensor): Rewards shape [batch_size]
+            next_states (torch.Tensor): Next states shape [batch_size, timesteps, input_dim]
+            dones (torch.Tensor): Done flags shape [batch_size]
+        Returns:
+            float: ค่า loss จากการฝึก
+        """
+        # ตรวจสอบ input types และ shapes
+        if not all(isinstance(x, torch.Tensor) for x in [states, actions, rewards, next_states, dones]):
+            logging.error("Inputs ต้องเป็น torch.Tensor")
+            raise ValueError("Inputs ต้องเป็น torch.Tensor")
+
+        if states.shape[1:] != (self.timesteps, self.input_dim) or next_states.shape[1:] != (self.timesteps, self.input_dim):
+            logging.error(f"State shape ไม่ถูกต้อง: ได้ {states.shape}, คาดหวัง [batch_size, {self.timesteps}, {self.input_dim}]")
+            raise ValueError(f"State shape ต้องเป็น [batch_size, {self.timesteps}, {self.input_dim}]")
+
+        if actions.dim() != 1 or rewards.dim() != 1 or dones.dim() != 1 or actions.size(0) != states.size(0):
+            logging.error("Actions, rewards, และ dones ต้องเป็น 1D tensors และมีขนาด batch เดียวกับ states")
+            raise ValueError("Actions, rewards, และ dones ต้องเป็น 1D tensors และมีขนาด batch เดียวกับ states")
+
+        # แปลง inputs ไปยัง device
+        states = states.to(self.device)
+        actions = actions.to(self.device, dtype=torch.long)
+        rewards = rewards.to(self.device)
+        next_states = next_states.to(self.device)
+        dones = dones.to(self.device, dtype=torch.float)
+
+        # คำนวณ Q-values
+        q_values = self.forward(states)  # [batch_size, action_space_size]
+        q_values = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)  # [batch_size]
+
+        # คำนวณ target Q-values
+        with torch.no_grad():
+            next_q_values = self.forward(next_states)  # [batch_size, action_space_size]
+            max_next_q_values = next_q_values.max(dim=1)[0]  # [batch_size]
+            target_q_values = rewards + (1 - dones) * self.gamma * max_next_q_values  # [batch_size]
+
+        # คำนวณ loss
+        loss = nn.MSELoss()(q_values, target_q_values)
+
+        # Backpropagation
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        # อัพเดท confidence และ loss history
+        self.loss_history.append(loss.item())
+        confidence = min(1.0 / (loss.item() + 1e-6), 1000.0)  # จำกัด confidence
+        self.confidence.append(confidence)
+
+        # ปรับ learning rate อัตโนมัติตาม loss history
+        if len(self.loss_history) >= 10:
+            avg_loss = sum(self.loss_history) / len(self.loss_history)
+            if avg_loss > 1.0:
+                self.optimizer.param_groups[0]['lr'] = min(self.learning_rate * 1.5, 0.001)
+                logging.debug(f"เพิ่ม learning rate เป็น {self.optimizer.param_groups[0]['lr']:.6f} เนื่องจาก loss สูง ({avg_loss:.4f})")
+            elif avg_loss < 0.1:
+                self.optimizer.param_groups[0]['lr'] = max(self.learning_rate * 0.5, 1e-5)
+                logging.debug(f"ลด learning rate เป็น {self.optimizer.param_groups[0]['lr']:.6f} เนื่องจาก loss ต่ำ ({avg_loss:.4f})")
+
+        logging.debug(f"Training step เสร็จสิ้น: loss={loss.item():.4f}, confidence={confidence:.4f}")
+        return loss.item()
+
+    def select_action(self, state, epsilon=None):
+        """เลือก action ด้วย epsilon-greedy policy
+        Args:
+            state (torch.Tensor): State shape [1, timesteps, input_dim]
+            epsilon (float, optional): Exploration rate หากไม่ระบุใช้ self.epsilon
+        Returns:
+            int: Action index
+        """
+        epsilon = epsilon if epsilon is not None else self.epsilon
+
+        if state.dim() == 2:
+            state = state.unsqueeze(0)  # เพิ่ม batch dimension
+        if state.shape[1:] != (self.timesteps, self.input_dim):
+            logging.error(f"State shape ไม่ถูกต้อง: ได้ {state.shape}, คาดหวัง [1, {self.timesteps}, {self.input_dim}]")
+            raise ValueError(f"State shape ต้องเป็น [1, {self.timesteps}, {self.input_dim}]")
+
+        if torch.rand(1).item() < epsilon:
+            action = torch.randint(0, self.action_space_size, (1,)).item()
+            logging.debug(f"เลือก action แบบสุ่ม: {action}")
+        else:
+            with torch.no_grad():
+                state = state.to(self.device)
+                q_values = self.forward(state)  # [1, action_space_size]
+                action = q_values.argmax(dim=1).item()
+                logging.debug(f"เลือก action จาก Q-values: {action}")
+
+        return action
+
+    def save_model(self, path):
+        """บันทึกโมเดลไปยังไฟล์
+        Args:
+            path (str): เส้นทางไฟล์สำหรับบันทึก
+        """
+        try:
+            torch.save(self.state_dict(), path)
+            logging.info(f"บันทึกโมเดลไปที่ {path}")
+        except Exception as e:
+            logging.error(f"บันทึกโมเดลล้มเหลว: {e}")
+
+    def load_model(self, path):
+        """โหลดโมเดลจากไฟล์
+        Args:
+            path (str): เส้นทางไฟล์สำหรับโหลด
+        """
+        try:
+            self.load_state_dict(torch.load(path, map_location=self.device))
+            logging.info(f"โหลดโมเดลจาก {path}")
+        except Exception as e:
+            logging.error(f"โหลดโมเดลล้มเหลว: {e}")
+
+    def check_input_compatibility(self, state):
+        """ตรวจสอบความเข้ากันได้ของ state
+        Args:
+            state (torch.Tensor): State tensor
+        Returns:
+            bool: True หากเข้ากันได้, False พร้อม log หากไม่เข้ากันได้
+        """
+        expected_shape = (self.timesteps, self.input_dim) if state.dim() == 2 else (1, self.timesteps, self.input_dim)
+        if state.shape[-2:] != (self.timesteps, self.input_dim):
+            logging.warning(f"State shape ไม่ตรงกับที่กำหนด: ได้ {state.shape}, คาดหวัง {expected_shape}")
+            return False
+        logging.debug("State เข้ากันได้กับโมเดล")
+        return True
