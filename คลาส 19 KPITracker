@@ -1,0 +1,21 @@
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install datetime logging
+
+from datetime import datetime, timedelta
+import logging
+
+class KPITracker:
+    def __init__(self):
+        self.total_profit = 0
+        self.daily_profit = 0
+        self.day_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    async def update(self, profit):
+        self.total_profit += profit
+        now = datetime.utcnow()
+        if now >= self.day_start + timedelta(days=1):
+            self.daily_profit = profit
+            self.day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            self.daily_profit += profit
+        logging.info(f"KPI อัพเดท: กำไรวันนี้={self.daily_profit:.2f}, กำไรรวม={self.total_profit:.2f}")
