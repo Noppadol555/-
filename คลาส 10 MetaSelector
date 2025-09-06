@@ -1,0 +1,63 @@
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install torch numpy
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+
+class MetaSelector(nn.Module):
+    def __init__(self, input_dim):
+        super(MetaSelector, self).__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # ตรวจสอบ GPU อัตโนมัติ
+        if torch.cuda.is_available():
+            prop = torch.cuda.get_device_properties(0)
+            if '5070 Ti' in prop.name:
+                print(f"Detected RTX 5070 Ti with CUDA capability {prop.major}.{prop.minor}")
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        ).to(self.device)
+        self.optimizer = optim.Adam(self.parameters(), lr=CONFIG['maml_lr_outer'])
+        self.confidence = {}
+
+    def forward(self, x):
+        x = x.to(self.device)
+        return self.model(x)
+
+    def predict(self, state):
+        with torch.no_grad():
+            score = self.forward(torch.FloatTensor(state).to(self.device)).cpu().numpy()
+            symbol_key = tuple(state)
+            confidence = self.confidence.get(symbol_key, 1.0)
+        return score[0] * confidence
+
+    def train_few_shot(self, state_batch, reward_batch):
+        state_batch = torch.FloatTensor(state_batch).to(self.device)
+        reward_batch = torch.FloatTensor(reward_batch).to(self.device)
+        fast_weights = [p.clone() for p in self.parameters()]
+        for _ in range(CONFIG['maml_steps']):
+            pred = self.model(state_batch)
+            loss = nn.MSELoss()(pred, reward_batch)
+            grads = torch.autograd.grad(loss, self.parameters(), create_graph=True)
+            fast_weights = [w - CONFIG['maml_lr_inner'] * g for w, g in zip(fast_weights, grads)]
+        for i, state in enumerate(state_batch):
+            symbol_key = tuple(state.cpu().numpy())
+            self.confidence[symbol_key] = 1 / (loss.item() + 1e-6)
+        return fast_weights, loss.item()
+
+    def train_meta(self, task_batch):
+        meta_loss = 0
+        for states, rewards in task_batch:
+            fast_weights, loss = self.train_few_shot(states, rewards)
+            pred = nn.Sequential(*self.model)(torch.FloatTensor(states).to(self.device))
+            meta_loss += nn.MSELoss()(pred, torch.FloatTensor(rewards).to(self.device))
+        self.optimizer.zero_grad()
+        meta_loss.backward()
+        self.optimizer.step()
+        return meta_loss.item()
