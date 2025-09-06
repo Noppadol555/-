@@ -1,0 +1,34 @@
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install asyncio gc torch
+
+import asyncio
+import gc
+import torch
+import logging
+
+class AutomaticBugFixer:
+    def __init__(self):
+        self.attempts_left = CONFIG['bug_fix_attempts']
+
+    async def analyze_and_fix(self, error, trader, env):
+        if not CONFIG['auto_bug_fix'] or self.attempts_left <= 0:
+            return False
+        error_str = str(error)
+        if "CUDA out of memory" in error_str:
+            trader.resource_manager.model_batch_sizes = {k: max(1, v // 2) for k, v in trader.resource_manager.model_batch_sizes.items()}
+            gc.collect()
+            torch.cuda.empty_cache()
+            logging.info("แก้ไข CUDA OOM: ลด batch size และเคลียร์หน่วยความจำ")
+        elif "API rate limit" in error_str:
+            await asyncio.sleep(60)
+            logging.info("แก้ไข API rate limit: รอ 60 วินาที")
+        elif "network" in error_str.lower():
+            await ws_manager.stop()
+            await ws_manager.start(env.symbols)
+            logging.info("แก้ไข network error: รีสตาร์ท WebSocket")
+        else:
+            logging.warning(f"ไม่สามารถแก้ไขบั๊ก: {error_str}")
+            self.attempts_left -= 1
+            return False
+        self.attempts_left -= 1
+        return True
