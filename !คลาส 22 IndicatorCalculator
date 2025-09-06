@@ -1,0 +1,33 @@
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install ta pandas
+
+import ta
+import pandas as pd
+
+class IndicatorCalculator:
+    def __init__(self, multi_tf_data):
+        self.multi_tf_data = multi_tf_data
+
+    def calculate_indicators(self, symbol):
+        indicators = {}
+        for tf in CONFIG['multi_tf_list']:
+            df = self.multi_tf_data[tf].get(symbol, pd.DataFrame())
+            if df.empty:
+                continue
+            close = df['close'].values
+            high = df['high'].values if 'high' in df else close
+            low = df['low'].values if 'low' in df else close
+            volume = df['volume'].values
+            indicators[tf] = {
+                'ATR': ta.volatility.AverageTrueRange(high, low, close).average_true_range().iloc[-1] if len(close) >= 14 else 0,
+                'RSI': ta.momentum.RSIIndicator(close).rsi().iloc[-1] if len(close) >= 14 else 50,
+                'MACD': ta.trend.MACD(close).macd().iloc[-1] if len(close) >= 26 else 0,
+                'EMA': ta.trend.EMAIndicator(close, window=20).ema_indicator().iloc[-1] if len(close) >= 20 else close[-1],
+                'BB_upper': ta.volatility.BollingerBands(close).bollinger_hband().iloc[-1] if len(close) >= 20 else close[-1],
+                'BB_lower': ta.volatility.BollingerBands(close).bollinger_lband().iloc[-1] if len(close) >= 20 else close[-1],
+                'SMA': ta.trend.SMAIndicator(close, window=20).sma_indicator().iloc[-1] if len(close) >= 20 else close[-1],
+                'Stoch_RSI': ta.momentum.StochasticRSIIndicator(close).stochrsi().iloc[-1] if len(close) >= 14 else 0.5,
+                'OBV': ta.volume.OnBalanceVolumeIndicator(close, volume).on_balance_volume().iloc[-1] if len(close) > 1 else volume[-1],
+                'Volume': volume[-1]
+            }
+        return indicators
