@@ -1,0 +1,236 @@
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install torch numpy bayesian-optimization pandas matplotlib seaborn darts torch-geometric scikit-learn
+
+import torch
+import numpy as np
+from collections import deque
+from bayes_opt import BayesianOptimization
+import gc
+import psutil
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+class UnifiedQuantumTrader:
+    def __init__(self, input_dim, discrete_action_size=3, continuous_action_dim=2, num_symbols=CONFIG['madrl_agent_count']):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # ตรวจสอบ GPU อัตโนมัติ
+        if torch.cuda.is_available():
+            prop = torch.cuda.get_device_properties(0)
+            if '5070 Ti' in prop.name:
+                print(f"Detected RTX 5070 Ti with CUDA capability {prop.major}.{prop.minor}")
+        self.input_dim = input_dim
+        self.discrete_action_size = discrete_action_size
+        self.continuous_action_dim = continuous_action_dim
+        self.qnt = QNetworkTransformer(input_dim, discrete_action_size)
+        self.evogan = EvoGAN(input_dim, discrete_action_size)
+        self.ddpg = DDPG(input_dim, continuous_action_dim, 'BTC/USDT')
+        self.ssd = SSD(input_dim)
+        self.tft = TFTWrapper(input_dim)
+        self.gnn = GNN(input_dim)
+        self.madrl = MADRL(input_dim, continuous_action_dim, num_symbols, symbols=['BTC/USDT']*num_symbols)
+        self.meta_selector = MetaSelector(input_dim)
+        self.replay_buffer = None  # จะเชื่อมใน main
+        self.strategy_memory = []
+        self.loss_history = {
+            'qnt': [], 'ssd': [], 'evogan_disc': [], 'evogan_gen': [],
+            'ddpg_actor': [], 'ddpg_critic': [], 'tft': [], 'gnn': [], 'madrl': [], 'meta': []
+        }
+        self.bayes_opt = BayesianOptimization(
+            f=self._bayes_objective,
+            pbounds={'qnt_w': (0, 1), 'evogan_w': (0, 1), 'tft_w': (0, 1), 'gnn_w': (0, 1), 'madrl_w': (0, 1)},
+            random_state=42
+        )
+        self.model_weights = {'qnt_w': 0.2, 'evogan_w': 0.2, 'tft_w': 0.2, 'gnn_w': 0.2, 'madrl_w': 0.2}
+        self.resource_manager = IntelligentResourceManager()  # เชื่อมใน main
+        self.overfit_detector = {'val_loss': deque(maxlen=50), 'train_loss': deque(maxlen=50)}
+        self.best_loss = float('inf')
+        self.patience = 10
+        self.wait = 0
+        self.adaptive_symbol_selector = {}
+        self.current_symbols = ['BTC/USDT'] * num_symbols
+        self.multi_tf_data = {tf: deque(maxlen=1000) for tf in CONFIG['multi_tf_list']}
+        self.risk_guardian = RiskGuardian()  # เชื่อมใน main
+        self.scaler = torch.cuda.amp.GradScaler()
+
+    def _bayes_objective(self, qnt_w, evogan_w, tft_w, gnn_w, madrl_w):
+        total = qnt_w + evogan_w + tft_w + gnn_w + madrl_w
+        if total == 0:
+            return 0
+        weights = {k: v / total for k, v in zip(['qnt_w', 'evogan_w', 'tft_w', 'gnn_w', 'madrl_w'], [qnt_w, evogan_w, tft_w, gnn_w, madrl_w])}
+        if self.replay_buffer and self.replay_buffer.buffer:
+            batch = self.replay_buffer.sample(32)
+            if batch:
+                states, discrete_actions, continuous_actions, rewards, _, _, _, _, _ = batch
+                pred_discrete, pred_continuous = self._combine_predictions(states, weights)
+                discrete_loss = np.mean((pred_discrete - discrete_actions) ** 2)
+                continuous_loss = np.mean((pred_continuous - continuous_actions) ** 2)
+                return -(discrete_loss + continuous_loss)
+        return 0
+
+    def _combine_predictions(self, state_data, weights):
+        with torch.cuda.amp.autocast():
+            q_values = self.qnt(torch.FloatTensor(state_data).to(self.device)).cpu().detach().numpy()
+            evogan_strategies = self.evogan.generate(state_data).cpu().detach().numpy()
+            tft_pred = self.tft.predict(state_data)
+            gnn_pred = self.gnn.forward(torch.FloatTensor(state_data).to(self.device),
+                                      self._create_graph(len(state_data))).cpu().detach().numpy()
+            madrl_actions = self.madrl.act(state_data)
+        model_confidences = {
+            'qnt': np.mean(self.qnt.confidence) if self.qnt.confidence else 1.0,
+            'evogan': np.mean(list(self.evogan.strategy_confidence.values())) if self.evogan.strategy_confidence else 1.0,
+            'tft': np.mean(self.tft.confidence_scores) if self.tft.confidence_scores else 1.0,
+            'gnn': np.mean(self.gnn.confidence) if self.gnn.confidence else 1.0,
+            'madrl': np.mean(self.madrl.confidence_history) if self.madrl.confidence_history else 1.0
+        }
+        total_confidence = sum(model_confidences.values())
+        dynamic_weights = {k: v / total_confidence * weights[k] for k, v in model_confidences.items()}
+        discrete_pred = (dynamic_weights['qnt'] * q_values +
+                        dynamic_weights['evogan'] * evogan_strategies +
+                        dynamic_weights['tft'] * tft_pred[:, :self.discrete_action_size])
+        continuous_pred = (dynamic_weights['madrl'] * madrl_actions +
+                          dynamic_weights['gnn'] * gnn_pred[:, :self.continuous_action_dim])
+        return discrete_pred, continuous_pred
+
+    def _create_graph(self, num_nodes):
+        edges = []
+        for i in range(num_nodes):
+            for j in range(i + 1, num_nodes):
+                symbol_i = self.current_symbols[i % len(self.current_symbols)]
+                symbol_j = self.current_symbols[j % len(self.current_symbols)]
+                if symbol_i in ws_manager.data and symbol_j in ws_manager.data:
+                    corr = np.corrcoef(
+                        [ws_manager.data[symbol_i]['close']] * TIMESTEPS,
+                        [ws_manager.data[symbol_j]['close']] * TIMESTEPS
+                    )[0, 1] if ws_manager.data[symbol_i]['close'] and ws_manager.data[symbol_j]['close'] else 0
+                    if abs(corr) > 0.5:
+                        edges.append([i, j])
+                        edges.append([j, i])
+        edge_index = torch.tensor(edges, dtype=torch.long).t().to(self.device) if edges else torch.tensor([[0, 0]], dtype=torch.long).t().to(self.device)
+        return Data(x=torch.ones((num_nodes, self.input_dim)), edge_index=edge_index)
+
+    def select_top_coins(self, all_symbols, ws_data, kpi_tracker):
+        scores = {}
+        multi_tf_states = self._aggregate_multi_tf_data(ws_data)
+        for symbol in all_symbols:
+            if symbol in ws_data:
+                state = np.array([ws_data[symbol]['close'], ws_data[symbol]['volume'], 0, 0, 0,
+                                ws_data[symbol]['funding_rate'], ws_data[symbol]['depth']])
+                meta_score = self.meta_selector.predict(state)
+                reward_pred = self.tft.predict(multi_tf_states.get(symbol, state.reshape(1, -1)))
+                volatility = np.std(reward_pred)
+                liquidity = ws_data[symbol]['volume']
+                if liquidity >= CONFIG['liquidity_threshold']:
+                    scores[symbol] = (meta_score * reward_pred.mean() * volatility * liquidity) / (1 + ws_data[symbol]['funding_rate'])
+        sorted_symbols = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        num_coins = max(CONFIG['min_coins_per_trade'], min(CONFIG['max_coins_per_trade'],
+                        int(len(sorted_symbols) * (kpi_tracker.total_profit / CONFIG['target_kpi_daily'] + 0.5))))
+        top_symbols = [s[0] for s in sorted_symbols[:num_coins]]
+        self.current_symbols = top_symbols
+        self.madrl.update_symbols(top_symbols)
+        self.adaptive_symbol_selector = scores
+        logging.info(f"เลือก {len(top_symbols)} เหรียญ: {top_symbols[:5]}...")
+        return top_symbols
+
+    def _aggregate_multi_tf_data(self, ws_data):
+        multi_tf_states = {}
+        for symbol in ws_data:
+            state = np.array([ws_data[symbol]['close'], ws_data[symbol]['volume'], 0, 0, 0,
+                            ws_data[symbol]['funding_rate'], ws_data[symbol]['depth']])
+            for tf in CONFIG['multi_tf_list']:
+                self.multi_tf_data[tf].append(state)
+            multi_tf_states[symbol] = {tf: np.array(list(self.multi_tf_data[tf])[-10:]) for tf in CONFIG['multi_tf_list']}
+        return multi_tf_states
+
+    def predict(self, state_data):
+        self.resource_manager.adjust_resources(self)
+        discrete_pred, continuous_pred = self._combine_predictions(state_data, self.model_weights)
+        return discrete_pred, continuous_pred
+
+    async def train(self, states, discrete_actions, continuous_actions, rewards, next_states):
+        batch_size = min(len(states), self.resource_manager.model_batch_sizes['qnt'])
+        if batch_size < 1:
+            return
+        states = np.array(states[:batch_size])
+        discrete_actions = np.array(discrete_actions[:batch_size])
+        continuous_actions = np.array(continuous_actions[:batch_size])
+        rewards = np.array(rewards[:batch_size])
+        next_states = np.array(next_states[:batch_size])
+        volatility = np.mean([self.replay_buffer.buffer[-1][-2] for _ in range(min(10, len(self.replay_buffer.buffer)))
+                            if self.replay_buffer.buffer[-1][-2] is not None]) if self.replay_buffer.buffer else 0.01
+        lr_factor = min(1.0, max(0.1, volatility / CONFIG['min_volatility_threshold']))
+        for opt in [self.qnt.optimizer, self.ddpg.actor_optimizer, self.ddpg.critic_optimizer]:
+            for param_group in opt.param_groups:
+                param_group['lr'] = 0.0001 * lr_factor
+        val_size = int(batch_size * 0.2)
+        train_size = batch_size - val_size
+        idx = np.random.permutation(batch_size)
+        train_idx, val_idx = idx[:train_size], idx[train_size:]
+        train_states, val_states = states[train_idx], states[val_idx]
+        train_discrete, val_discrete = discrete_actions[train_idx], discrete_actions[val_idx]
+        train_continuous, val_continuous = continuous_actions[train_idx], continuous_actions[val_idx]
+        train_rewards, val_rewards = rewards[train_idx], rewards[val_idx]
+        train_next_states, val_next_states = next_states[train_idx], next_states[val_idx]
+
+        with torch.cuda.amp.autocast():
+            qnt_loss = self.qnt.train_step(train_states, train_discrete, train_rewards, train_next_states, torch.zeros(len(train_states)))
+            self.ddpg.train(train_states, train_continuous, train_rewards, train_next_states)
+            ssd_loss = self.ssd.train(train_states, train_next_states, volatility)
+            disc_loss, gen_loss = self.evogan.train(train_discrete, self.evogan.generate(train_states).cpu().detach().numpy())
+            self.tft.train(train_states, train_next_states)
+            self.madrl.train(train_states, train_continuous, train_rewards, train_next_states)
+            meta_loss = self.meta_selector.train_meta([(train_states, train_rewards)])
+
+        val_q_values = self.qnt(torch.FloatTensor(val_states).to(self.device)).cpu().detach().numpy()
+        val_loss = np.mean((val_q_values - val_discrete) ** 2)
+        train_loss = np.mean((self.qnt(torch.FloatTensor(train_states).to(self.device)).cpu().detach().numpy() - train_discrete) ** 2)
+        self.overfit_detector['val_loss'].append(val_loss)
+        self.overfit_detector['train_loss'].append(train_loss)
+
+        if len(self.overfit_detector['val_loss']) > 10 and np.mean(self.overfit_detector['val_loss']) > np.mean(self.overfit_detector['train_loss']) * 1.5:
+            logging.warning(f"ตรวจพบ overfitting: val_loss={np.mean(self.overfit_detector['val_loss']):.4f}, train_loss={np.mean(self.overfit_detector['train_loss']):.4f}")
+            for model in [self.qnt, self.ddpg.actor, self.ddpg.critic, self.ssd]:
+                for param_group in model.optimizer.param_groups:
+                    param_group['weight_decay'] *= 1.2
+            for layer in [self.qnt.dropout1, self.qnt.dropout2]:
+                layer.p = min(layer.p + 0.1, 0.5)
+            logging.info("ปรับ regularization เพื่อแก้ overfitting")
+
+        if val_loss < self.best_loss:
+            self.best_loss = val_loss
+            self.wait = 0
+        else:
+            self.wait += 1
+            if self.wait >= self.patience:
+                logging.info("Early stopping ทำงาน หยุดฝึกเพื่อป้องกัน overfitting")
+                return
+
+        self.loss_history['qnt'].append(train_loss)
+        self.loss_history['ssd'].append(ssd_loss)
+        self.loss_history['evogan_disc'].append(disc_loss)
+        self.loss_history['evogan_gen'].append(gen_loss)
+        self.loss_history['ddpg_critic'].append(np.mean((self.ddpg.critic(torch.FloatTensor(np.concatenate([train_states, train_continuous], axis=1)).to(self.device)).cpu().detach().numpy() - train_rewards) ** 2))
+        self.loss_history['tft'].append(np.mean((self.tft.predict(train_states) - train_next_states) ** 2))
+        self.loss_history['madrl'].append(np.mean((self.madrl.critic(torch.FloatTensor(np.concatenate([train_states.flatten(), train_continuous.flatten()])).to(self.device)).cpu().detach().numpy() - train_rewards) ** 2))
+        self.loss_history['meta'].append(meta_loss)
+
+    async def evolve(self, state_data, reward, volatility):
+        strategies = self.evogan.generate(state_data).cpu().detach().numpy()
+        self.strategy_memory.extend(strategies)
+        if len(self.strategy_memory) >= 10:
+            evolved_strategies = self.evogan.evolve(self.strategy_memory, [reward] * len(self.strategy_memory))
+            self.strategy_memory = evolved_strategies[:10]
+
+    async def adversarial_train(self, states):
+        noise = np.random.normal(0, 0.1, states.shape)
+        adv_states = states + noise
+        adv_q_values = self.qnt(torch.FloatTensor(adv_states).to(self.device)).cpu().detach().numpy()
+        adv_continuous = self.ddpg.act(adv_states)
+        batch = self.replay_buffer.sample(32)
+        if batch:
+            orig_states, discrete_actions, continuous_actions, rewards, next_states, _, _, _, _ = batch
+            await self.train(np.concatenate([orig_states, adv_states]),
+                           np.concatenate([discrete_actions, discrete_actions]),
+                           np.concatenate([continuous_actions, adv_continuous]),
+                           np.concatenate([rewards, rewards * 0.5]),
+                           np.concatenate([next_states, next_states]))
