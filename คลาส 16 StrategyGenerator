@@ -1,0 +1,42 @@
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install numpy
+
+import numpy as np
+import logging
+
+class StrategyGenerator:
+    def __init__(self, trader, env, risk_guardian):
+        self.trader = trader
+        self.env = env
+        self.risk_guardian = risk_guardian
+        self.action_map = {0: 'HOLD', 1: 'BUY', 2: 'SELL'}
+
+    async def generate_strategy(self, state, symbol, volatility):
+        discrete_pred, continuous_pred = self.trader.predict(state)
+        action_idx = np.argmax(discrete_pred[0])
+        action = self.action_map[action_idx]
+        leverage, size = continuous_pred[0]
+        stop_loss = CONFIG['stop_loss_percentage'] * (1 + volatility / CONFIG['min_volatility_threshold'])
+        take_profit = stop_loss * 2
+        return {
+            'action': action,
+            'symbol': symbol,
+            'size': size,
+            'leverage': min(leverage, CONFIG['max_leverage_per_symbol'].get(symbol, 125)),
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'trailing_stop': stop_loss if volatility > CONFIG['min_volatility_threshold'] else None,
+            'trailing_take_profit': take_profit if volatility > CONFIG['min_volatility_threshold'] else None
+        }
+
+    async def execute_strategy(self, strategy):
+        if strategy['action'] == 'HOLD' or not self.risk_guardian.assess_risk(self.env.account_balance, self.env.initial_balance):
+            return 0
+        profit = await self.env.execute_trade_async(
+            strategy['symbol'], strategy['action'], strategy['size'], strategy['leverage'],
+            strategy['stop_loss'], strategy['take_profit'], strategy['trailing_stop'], strategy['trailing_take_profit']
+        )
+        self.risk_guardian.total_trades += 1
+        if profit < 0:
+            self.risk_guardian.failed_trades += 1
+        return profit
