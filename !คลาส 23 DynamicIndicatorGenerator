@@ -1,0 +1,62 @@
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install torch numpy torch-geometric
+
+import torch
+import numpy as np
+from torch_geometric.data import Data
+
+class DynamicIndicatorGenerator:
+    def __init__(self, evogan, gnn, multi_tf_data):
+        self.evogan = evogan
+        self.gnn = gnn
+        self.multi_tf_data = multi_tf_data
+        self.base_calc = IndicatorCalculator(multi_tf_data)
+        self.feature_weights = torch.tensor([
+            1.0,  # ATR
+            0.5,  # RSI
+            1.0,  # MACD
+            1.0,  # EMA
+            0.5,  # BB_upper
+            0.5,  # BB_lower
+            0.5,  # SMA
+            0.5,  # Stoch_RSI
+            1.0,  # OBV
+            1.0   # Volume
+        ]).to(self.evogan.device)
+
+    def generate_synthetic_indicators(self, symbol):
+        synthetic = {}
+        base_ind = self.base_calc.calculate_indicators(symbol)
+        for tf in CONFIG['multi_tf_list']:
+            if tf not in base_ind:
+                continue
+            base_features = np.array([
+                base_ind[tf]['ATR'], base_ind[tf]['MACD'], base_ind[tf]['EMA'],
+                base_ind[tf]['OBV'], base_ind[tf]['Volume'],
+                base_ind[tf]['RSI'], base_ind[tf]['BB_upper'], base_ind[tf]['BB_lower'],
+                base_ind[tf]['SMA'], base_ind[tf]['Stoch_RSI']
+            ])
+            weighted_features = base_features * self.feature_weights.cpu().numpy()
+            synthetic_features = self.evogan.generate(
+                torch.FloatTensor(weighted_features).to(self.evogan.device)
+            ).cpu().numpy()
+            graph = self._create_asset_graph(self.multi_tf_data)
+            gnn_features = self.gnn.forward(
+                torch.FloatTensor(synthetic_features).to(self.gnn.device), graph
+            ).cpu().numpy()
+            synthetic[tf] = {
+                'base': base_ind[tf],
+                'synthetic': synthetic_features,
+                'gnn_correlations': gnn_features
+            }
+        return synthetic
+
+    def _create_asset_graph(self, multi_tf_data):
+        num_assets = len(multi_tf_data[CONFIG['multi_tf_list'][0]])
+        edges = []
+        for i in range(num_assets):
+            for j in range(i + 1, num_assets):
+                edges.append([i, j])
+                edges.append([j, i])
+        edge_index = torch.tensor(edges, dtype=torch.long).t().to(self.gnn.device) if edges else torch.tensor([[0, 0]], dtype=torch.long).t().to(self.gnn.device)
+        return Data(edge_index=edge_index)
