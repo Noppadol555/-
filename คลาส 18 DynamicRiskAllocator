@@ -1,0 +1,21 @@
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install numpy asyncio
+
+import numpy as np
+import asyncio
+import logging
+
+class DynamicRiskAllocator:
+    def __init__(self):
+        self.base_risk = CONFIG['risk_per_trade']
+
+    async def allocate_risk(self, symbols, ws_data, kpi_factor):
+        risk_weights = {}
+        for symbol in symbols:
+            if symbol in ws_data:
+                volatility = np.std([ws_data[symbol]['close']] if 'close' in ws_data[symbol] else [0]) or 0.01
+                liquidity = ws_data[symbol].get('volume', 0)
+                risk_weights[symbol] = self.base_risk * (1 / (volatility + 1e-6)) * (liquidity / CONFIG['liquidity_threshold']) * kpi_factor
+            else:
+                risk_weights[symbol] = self.base_risk
+        return risk_weights
