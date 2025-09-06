@@ -1,0 +1,96 @@
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install torch numpy
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from collections import deque
+
+class MADRL:
+    def __init__(self, state_dim, action_dim, num_agents=CONFIG['madrl_agent_count'], symbols=None):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # ตรวจสอบ GPU อัตโนมัติ
+        if torch.cuda.is_available():
+            prop = torch.cuda.get_device_properties(0)
+            if '5070 Ti' in prop.name:
+                print(f"Detected RTX 5070 Ti with CUDA capability {prop.major}.{prop.minor}")
+        self.num_agents = min(num_agents, CONFIG['madrl_agent_count'])
+        self.symbols = symbols or []
+        self.max_actions = [CONFIG['max_leverage_per_symbol'].get(s, 125) for s in self.symbols]
+        self.actors = [nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_dim),
+            nn.Tanh()
+        ).to(self.device) for _ in range(self.num_agents)]
+        self.actor_targets = [nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_dim),
+            nn.Tanh()
+        ).to(self.device) for _ in range(self.num_agents)]
+        self.critic = nn.Sequential(
+            nn.Linear(state_dim * self.num_agents + action_dim * self.num_agents, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        ).to(self.device)
+        self.critic_target = nn.Sequential(
+            nn.Linear(state_dim * self.num_agents + action_dim * self.num_agents, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        ).to(self.device)
+        self.actor_optimizers = [optim.Adam(actor.parameters(), lr=0.0001) for actor in self.actors]
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=0.001)
+        for i in range(self.num_agents):
+            self.actor_targets[i].load_state_dict(self.actors[i].state_dict())
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.confidence_history = deque(maxlen=50)
+
+    def act(self, states):
+        states = torch.FloatTensor(states).to(self.device)
+        actions = [self.actors[i](states[i]).cpu().detach().numpy() * self.max_actions[i] for i in range(self.num_agents)]
+        return np.clip(np.array(actions), CONFIG['min_leverage'], self.max_actions)
+
+    def train(self, state_batch, action_batch, reward_batch, next_state_batch):
+        state_batch = torch.FloatTensor(state_batch).to(self.device)
+        action_batch = torch.FloatTensor(action_batch).to(self.device)
+        reward_batch = torch.FloatTensor(reward_batch).unsqueeze(1).to(self.device)
+        next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
+        next_actions = torch.stack([self.actor_targets[i](next_state_batch[i]) for i in range(self.num_agents)])
+        critic_input = torch.cat([state_batch.view(-1), action_batch.view(-1)], dim=0)
+        next_critic_input = torch.cat([next_state_batch.view(-1), next_actions.view(-1)], dim=0)
+        target_q = self.critic_target(next_critic_input) + 0.99 * reward_batch
+        current_q = self.critic(critic_input)
+        critic_loss = nn.MSELoss()(current_q, target_q.detach())
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+        for i in range(self.num_agents):
+            actions_pred = self.actors[i](state_batch[i])
+            actor_loss = -self.critic(torch.cat([state_batch.view(-1), actions_pred.view(-1)], dim=0)).mean()
+            self.actor_optimizers[i].zero_grad()
+            actor_loss.backward()
+            self.actor_optimizers[i].step()
+        for i in range(self.num_agents):
+            for t_param, param in zip(self.actor_targets[i].parameters(), self.actors[i].parameters()):
+                t_param.data.copy_(0.001 * param.data + 0.999 * t_param.data)
+        for t_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            t_param.data.copy_(0.001 * param.data + 0.999 * t_param.data)
+        self.confidence_history.append(1 / (critic_loss.item() + 1e-6))
+
+    def update_symbols(self, new_symbols):
+        self.symbols = new_symbols
+        self.num_agents = min(len(new_symbols), CONFIG['madrl_agent_count'])
+        self.max_actions = [CONFIG['max_leverage_per_symbol'].get(s, 125) for s in self.symbols]
+        self.actors = self.actors[:self.num_agents]
+        self.actor_targets = self.actor_targets[:self.num_agents]
+        self.actor_optimizers = self.actor_optimizers[:self.num_agents]
