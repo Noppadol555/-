@@ -1,0 +1,85 @@
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (สมมติว่าติดตั้งแล้วผ่าน pip install torch numpy collections)
+# import ที่จำเป็นสำหรับคลาส DDPG
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from collections import deque
+
+class DDPG:
+    def __init__(self, state_dim, action_dim, symbol):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.max_action = CONFIG.get('max_leverage_per_symbol', {}).get(symbol, 125)  # ซิงค์กับ global CONFIG จาก API
+        self.min_action = CONFIG['min_leverage']  # ใช้ min_leverage จาก global CONFIG (สร้างในคลาสที่ 1)
+        self.actor = nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, action_dim),
+            nn.Tanh()
+        ).to(self.device)
+        self.actor_target = nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, action_dim),
+            nn.Tanh()
+        ).to(self.device)
+        self.critic = nn.Sequential(
+            nn.Linear(state_dim + action_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 1)
+        ).to(self.device)
+        self.critic_target = nn.Sequential(
+            nn.Linear(state_dim + action_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 1)
+        ).to(self.device)
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=0.0001, weight_decay=0.01)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=0.001, weight_decay=0.01)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.confidence_history = deque(maxlen=50)
+
+    def act(self, state):
+        state = torch.FloatTensor(state).to(self.device)
+        action = self.actor(state).cpu().detach().numpy() * self.max_action
+        return np.clip(action, self.min_action, self.max_action)  # clip ระหว่าง min และ max leverage (ปรับอัตโนมัติ)
+
+    def train(self, state_batch, action_batch, reward_batch, next_state_batch):
+        state_batch = torch.FloatTensor(state_batch).to(self.device)
+        action_batch = torch.FloatTensor(action_batch).to(self.device)
+        reward_batch = torch.FloatTensor(reward_batch).unsqueeze(1).to(self.device)
+        next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
+        next_actions = self.actor_target(next_state_batch)
+        target_q = self.critic_target(torch.cat([next_state_batch, next_actions], dim=1))
+        target_q = reward_batch + 0.99 * target_q.detach()
+        current_q = self.critic(torch.cat([state_batch, action_batch], dim=1))
+        critic_loss = nn.MSELoss()(current_q, target_q)
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+        actions_pred = self.actor(state_batch)
+        actor_loss = -self.critic(torch.cat([state_batch, actions_pred], dim=1)).mean()
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(0.001 * param.data + 0.999 * target_param.data)
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(0.001 * param.data + 0.999 * target_param.data)
+        self.confidence_history.append(1 / (critic_loss.item() + 1e-6))
