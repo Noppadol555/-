@@ -1,0 +1,41 @@
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install torch-geometric
+
+import torch
+import torch_geometric.nn as pyg_nn
+from torch_geometric.data import Data
+import numpy as np
+from collections import deque
+
+class GNN(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim=64):
+        super(GNN, self).__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # ตรวจสอบ GPU อัตโนมัติ
+        if torch.cuda.is_available():
+            prop = torch.cuda.get_device_properties(0)
+            if '5070 Ti' in prop.name:
+                print(f"Detected RTX 5070 Ti with CUDA capability {prop.major}.{prop.minor}")
+        self.conv1 = pyg_nn.GCNConv(input_dim, hidden_dim)
+        self.conv2 = pyg_nn.GCNConv(hidden_dim, hidden_dim)
+        self.fc = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
+        self.confidence = deque(maxlen=50)
+        self.to(self.device)
+
+    def forward(self, x, edge_index):
+        x = x.to(self.device)
+        edge_index = edge_index.to(self.device)
+        x = torch.relu(self.conv1(x, edge_index))
+        x = torch.relu(self.conv2(x, edge_index))
+        x = self.fc(x)
+        return x
+
+    def train(self, graph_data):
+        self.optimizer.zero_grad()
+        out = self.forward(graph_data.x, graph_data.edge_index)
+        loss = torch.nn.MSELoss()(out, graph_data.y)
+        loss.backward()
+        self.optimizer.step()
+        self.confidence.append(1 / (loss.item() + 1e-6))
+        return loss.item()
