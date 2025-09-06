@@ -1,0 +1,79 @@
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install sqlite3 zlib pickle numpy sklearn
+
+import sqlite3
+import zlib
+import pickle
+import numpy as np
+from collections import deque
+from sklearn.ensemble import IsolationForest
+import logging
+
+class ReplayBuffer:
+    def __init__(self, db_path='replay_buffer.db', capacity=10000):
+        self.db_path = db_path
+        self.buffer = deque(maxlen=capacity)
+        self.db_conn = sqlite3.connect(self.db_path, timeout=10)
+        self.db_conn.execute("CREATE TABLE IF NOT EXISTS experiences (id INTEGER PRIMARY KEY, state BLOB, discrete_action INTEGER, continuous_action BLOB, reward REAL, next_state BLOB, gnn_embedding BLOB, tft_pred BLOB, atr REAL, multi_tf_data BLOB)")
+        self.db_size = 0
+        self.anomaly_detector = IsolationForest(contamination=0.05, random_state=42)
+        self.load_from_db()
+
+    def add(self, state, discrete_action, continuous_action, reward, next_state, gnn_embedding=None, tft_pred=None, atr=None, multi_tf_data=None):
+        state_blob = zlib.compress(pickle.dumps(state))
+        continuous_action_blob = zlib.compress(pickle.dumps(continuous_action))
+        next_state_blob = zlib.compress(pickle.dumps(next_state))
+        gnn_embedding_blob = zlib.compress(pickle.dumps(gnn_embedding)) if gnn_embedding is not None else None
+        tft_pred_blob = zlib.compress(pickle.dumps(tft_pred)) if tft_pred is not None else None
+        multi_tf_data_blob = zlib.compress(pickle.dumps(multi_tf_data)) if multi_tf_data is not None else None
+        features = np.concatenate([state.flatten(), [discrete_action], continuous_action, [reward]])
+        if len(self.buffer) > 50 and self.anomaly_detector.predict([features])[0] == -1:
+            logging.warning(f"ตรวจพบ anomaly ในข้อมูล: reward={reward}, ปรับลดน้ำหนัก")
+            reward *= 0.5
+        self.buffer.append((state, discrete_action, continuous_action, reward, next_state, gnn_embedding, tft_pred, atr, multi_tf_data))
+        with self.db_conn:
+            self.db_conn.execute("INSERT INTO experiences (state, discrete_action, continuous_action, reward, next_state, gnn_embedding, tft_pred, atr, multi_tf_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                 (state_blob, discrete_action, continuous_action_blob, reward, next_state_blob, gnn_embedding_blob, tft_pred_blob, atr, multi_tf_data_blob))
+            self.db_size += 1
+        if self.db_size % 100 == 0:
+            self.fit_anomaly_detector()
+
+    def sample(self, batch_size=32):
+        if len(self.buffer) < batch_size:
+            return None
+        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+        batch = [self.buffer[i] for i in indices]
+        states = np.array([x[0] for x in batch])
+        discrete_actions = np.array([x[1] for x in batch])
+        continuous_actions = np.array([x[2] for x in batch])
+        rewards = np.array([x[3] for x in batch])
+        next_states = np.array([x[4] for x in batch])
+        gnn_embeddings = np.array([x[5] for x in batch if x[5] is not None], dtype=object)
+        tft_preds = np.array([x[6] for x in batch if x[6] is not None], dtype=object)
+        atrs = np.array([x[7] for x in batch if x[7] is not None])
+        multi_tf_data = np.array([x[8] for x in batch if x[8] is not None], dtype=object)
+        return states, discrete_actions, continuous_actions, rewards, next_states, gnn_embeddings, tft_preds, atrs, multi_tf_data
+
+    def load_from_db(self):
+        with self.db_conn:
+            cursor = self.db_conn.execute("SELECT state, discrete_action, continuous_action, reward, next_state, gnn_embedding, tft_pred, atr, multi_tf_data FROM experiences ORDER BY id DESC LIMIT 10000")
+            data = cursor.fetchall()
+            for row in data[::-1]:
+                state = pickle.loads(zlib.decompress(row[0]))
+                continuous_action = pickle.loads(zlib.decompress(row[2]))
+                next_state = pickle.loads(zlib.decompress(row[4]))
+                gnn_embedding = pickle.loads(zlib.decompress(row[5])) if row[5] else None
+                tft_pred = pickle.loads(zlib.decompress(row[6])) if row[6] else None
+                multi_tf_data = pickle.loads(zlib.decompress(row[8])) if row[8] else None
+                self.buffer.append((state, row[1], continuous_action, row[3], next_state, gnn_embedding, tft_pred, row[7], multi_tf_data))
+        logging.info(f"โหลด {len(data)} ข้อมูลจาก SQLite")
+        if len(self.buffer) > 50:
+            self.fit_anomaly_detector()
+
+    def fit_anomaly_detector(self):
+        data = [np.concatenate([e[0].flatten(), np.array([e[1]]), e[2], np.array([e[3]])]) for e in self.buffer]
+        self.anomaly_detector.fit(data)
+        logging.debug("อัพเดท anomaly detector")
+
+    def __del__(self):
+        self.db_conn.close()
