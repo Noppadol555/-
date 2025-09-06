@@ -1,0 +1,55 @@
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install pandas numpy ta
+
+import pandas as pd
+import numpy as np
+import ta
+import logging
+
+class RealTimeSimulator:
+    def __init__(self, symbols):
+        self.symbols = symbols
+        self.data = {symbol: pd.DataFrame() for symbol in symbols}
+        self.step = 0
+
+    def update_symbols(self, symbols):
+        self.symbols = symbols
+        self.data = {symbol: pd.DataFrame() for symbol in symbols if symbol not in self.data}
+
+    def simulate_step(self):
+        for symbol in self.symbols:
+            if self.data[symbol].empty:
+                df = pd.DataFrame(index=range(1440), columns=['close', 'volume'])
+                df['close'] = 10000 * (1 + np.random.normal(CONFIG['sim_trend'], CONFIG['sim_volatility'], 1440))
+                df['volume'] = np.random.uniform(50, 500, 1440)
+                if np.random.random() < CONFIG['sim_spike_chance']:
+                    spike_idx = np.random.randint(0, 1440)
+                    df.loc[spike_idx, 'close'] *= 1.1
+                self.data[symbol] = df
+            else:
+                new_price = self.data[symbol]['close'].iloc[-1] * (1 + np.random.normal(CONFIG['sim_trend'], CONFIG['sim_volatility']))
+                new_volume = np.random.uniform(50, 500)
+                self.data[symbol].loc[len(self.data[symbol])] = [new_price, new_volume]
+        self.step += 1
+
+    def get_data(self, symbol):
+        df = self.data[symbol]
+        if len(df) < 10:
+            return np.zeros((10, 7)), None, np.zeros(7), None, None, df
+        window = df.tail(10)
+        close = window['close'].values
+        volume = window['volume'].values
+        rsi = ta.momentum.RSIIndicator(close).rsi().values[-1] or 50
+        macd = ta.trend.MACD(close).macd().values[-1] or 0
+        rv = np.std(close) / np.mean(close) if np.mean(close) != 0 else 0
+        funding_rate = 0.0001
+        depth = 0
+        state_lstm = np.array([close, volume, [rsi]*10, [macd]*10, [rv]*10, [funding_rate]*10, [depth]*10]).T
+        state_ensemble = np.array([close[-1], volume[-1], rsi, macd, rv, funding_rate, depth])
+        scaler = RobustScaler()
+        scaled_lstm = scaler.fit_transform(state_lstm)
+        return scaled_lstm, None, state_ensemble, None, scaler, df
+
+    def reset(self):
+        self.step = 0
+        self.data = {symbol: pd.DataFrame() for symbol in self.symbols}
