@@ -1,0 +1,17 @@
+# ===============================================
+# ฟังก์ชัน control_loop: ตรวจสอบการกด 'q' เพื่อหยุดระบบอย่างปลอดภัย
+# การใช้งาน: รันใน background เพื่อ monitor keyboard input และหยุดระบบเมื่อกด 'q'
+# ===============================================
+async def control_loop():
+    while GlobalConfig.get('system_running'):
+        if keyboard.is_pressed('q'):
+            GlobalConfig.set('system_running', False)
+            logging.info("ตรวจพบการกด 'q': กำลังหยุดระบบอย่างปลอดภัย...")
+            # หยุด WebSocket และปิด exchange
+            await ws_manager.stop()
+            await exchange.close()
+            # หยุด emergency stop ถ้ามีตำแหน่งเปิด
+            await risk_guardian.emergency_stop()
+            logging.info("ระบบหยุดทำงานและปิดทุกส่วนอย่างปลอดภัย")
+            break
+        await asyncio.sleep(0.1)
