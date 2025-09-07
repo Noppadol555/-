@@ -1,0 +1,178 @@
+# คลาสที่ 5: EvoGAN
+
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install torch numpy
+
+import torch
+import torch.nn as nn
+import numpy as np
+from collections import deque
+import random
+
+# กำหนด TIMESTEPS จากต้นฉบับ (ใช้ใน input shape)
+TIMESTEPS = 10
+
+class EvoGAN:
+    def __init__(self, input_dim, action_space_size):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.generator = nn.Sequential(
+            nn.utils.spectral_norm(nn.Linear(input_dim * TIMESTEPS, 512)),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
+            nn.utils.spectral_norm(nn.Linear(512, 256)),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
+            nn.utils.spectral_norm(nn.Linear(256, action_space_size)),
+            nn.Softmax(dim=-1)
+        ).to(self.device)
+        
+        self.discriminator = nn.Sequential(
+            nn.utils.spectral_norm(nn.Linear(action_space_size, 256)),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
+            nn.utils.spectral_norm(nn.Linear(256, 128)),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
+            nn.Linear(128, 1)
+        ).to(self.device)
+        
+        self.gen_optimizer = torch.optim.AdamW(self.generator.parameters(), lr=0.0002, weight_decay=0.01, betas=(0.0, 0.99))
+        self.disc_optimizer = torch.optim.AdamW(self.discriminator.parameters(), lr=0.0002, weight_decay=0.01, betas=(0.0, 0.99))
+        self.gen_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.gen_optimizer, T_max=GlobalConfig.get('nas_iterations'))
+        self.disc_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.disc_optimizer, T_max=GlobalConfig.get('nas_iterations'))
+        
+        self.evo_population = []
+        self.strategy_confidence = {}
+        self.critic_iters = 5
+        self.gp_lambda = 10.0  # คิดเองจาก best practices
+        self.diversity_weight = 0.5  # คิดเองจาก best practices
+        self.perturb_std = 0.05  # คิดเองจาก best practices
+        self.current_iter = 0  # สำหรับปรับอัตโนมัติ
+
+    def generate(self, state):
+        state = torch.FloatTensor(state).to(self.device)
+        strategy = self.generator(state.view(-1, TIMESTEPS * state.shape[-1]))
+        confidence = -self.discriminator(strategy).mean().item()
+        self.strategy_confidence[tuple(strategy.cpu().detach().numpy()[0])] = confidence
+        return strategy
+
+    def train(self, real_strategies, fake_strategies):
+        real_strategies = torch.FloatTensor(real_strategies).to(self.device)
+        fake_strategies = torch.FloatTensor(fake_strategies).to(self.device)
+        
+        disc_losses = []
+        for _ in range(self.critic_iters):
+            self.disc_optimizer.zero_grad()
+            real_validity = self.discriminator(real_strategies)
+            fake_validity = self.discriminator(fake_strategies.detach())
+            alpha = torch.rand(real_strategies.size(0), 1).to(self.device)
+            interpolates = (alpha * real_strategies + (1 - alpha) * fake_strategies.detach()).requires_grad_(True)
+            disc_interpolates = self.discriminator(interpolates)
+            gradients = torch.autograd.grad(outputs=disc_interpolates, inputs=interpolates,
+                                            grad_outputs=torch.ones_like(disc_interpolates),
+                                            create_graph=True, retain_graph=True)[0]
+            gp = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * self.gp_lambda
+            disc_loss = -real_validity.mean() + fake_validity.mean() + gp
+            disc_loss.backward()
+            self.disc_optimizer.step()
+            disc_losses.append(disc_loss.item())
+        
+        self.gen_optimizer.zero_grad()
+        gen_validity = self.discriminator(fake_strategies)
+        gen_loss = -gen_validity.mean()
+        gen_loss.backward()
+        self.gen_optimizer.step()
+        
+        self.gen_scheduler.step()
+        self.disc_scheduler.step()
+        
+        # ปรับอัตโนมัติ: ถ้า gen_loss สูงเกิน threshold, เพิ่ม critic_iters
+        if gen_loss.item() > 1.0 and self.critic_iters < 10:
+            self.critic_iters += 1
+        
+        return np.mean(disc_losses), gen_loss.item()
+
+    def evolve(self, strategies, rewards):
+        strategies_np = np.array(strategies)
+        diversity_scores = -np.sum(strategies_np * np.log(strategies_np + 1e-10), axis=1)
+        fitness = np.array(rewards) + self.diversity_weight * diversity_scores
+        self.evo_population = sorted(zip(strategies, fitness), key=lambda x: x[1], reverse=True)[:10]
+        
+        for _ in range(5):
+            indices = np.random.choice(range(5), 2, replace=False)
+            parent1 = torch.FloatTensor(self.evo_population[indices[0]][0]).to(self.device)
+            parent2 = torch.FloatTensor(self.evo_population[indices[1]][0]).to(self.device)
+            child = (parent1 + parent2) / 2
+            child.requires_grad_(True)
+            self.gen_optimizer.zero_grad()
+            loss = -self.discriminator(child.unsqueeze(0)).mean()
+            loss.backward()
+            with torch.no_grad():
+                child = child - 0.01 * child.grad
+            child = child.detach().cpu().numpy() + np.random.normal(0, 0.01, size=child.shape)
+            self.evo_population.append((child, 0))
+        
+        return [p[0] for p in sorted(self.evo_population, key=lambda x: x[1], reverse=True)[:10]]
+
+    def search_architecture(self, state_dim, action_dim):
+        population = self._generate_initial_population()
+        supernet = self.generator.state_dict()
+        for iter in range(GlobalConfig.get('nas_iterations')):
+            self.current_iter = iter
+            fitness = self._evaluate_population(population, supernet)
+            population = self._evolve_population(population, fitness)
+            if iter % 20 == 0 and iter > 0:
+                self._grow_architecture()
+        return population[0]
+
+    def _generate_initial_population(self):
+        base_dict = self.generator.state_dict()
+        population = []
+        for _ in range(20):
+            new_dict = {k: v.clone() + torch.randn_like(v) * self.perturb_std for k, v in base_dict.items()}
+            population.append(new_dict)
+        return population
+
+    def _evaluate_population(self, population, supernet):
+        fitness = []
+        batch_size = 32 + (self.current_iter // 10)  # ปรับ batch size อัตโนมัติตาม iter
+        dummy_state = np.random.randn(batch_size, TIMESTEPS * state_dim) * np.random.uniform(0.01, 0.05)
+        dummy_real = np.random.uniform(0, 1, (batch_size, action_dim))
+        for arch in population:
+            temp_gen = type(self.generator)()
+            temp_gen.load_state_dict(arch)
+            temp_gen.to(self.device)
+            fake = temp_gen(torch.FloatTensor(dummy_state).to(self.device)).detach().cpu().numpy()
+            with torch.no_grad():
+                super_fake = self.generator(torch.FloatTensor(dummy_state).to(self.device)).cpu().numpy()
+            kd_loss = np.mean((fake - super_fake) ** 2)
+            _, gen_loss = self.train(dummy_real, fake)
+            entropy = -np.sum(fake * np.log(fake + 1e-10)) / len(fake)
+            fit = - (gen_loss + kd_loss) + self.diversity_weight * entropy
+            fitness.append(fit)
+        return fitness
+
+    def _evolve_population(self, population, fitness):
+        sorted_idx = np.argsort(fitness)[::-1]
+        sorted_pop = [population[i] for i in sorted_idx]
+        new_pop = sorted_pop[:10]
+        for _ in range(10):
+            competitors = random.sample(range(len(sorted_pop)), 4)
+            p1_idx = max(competitors[:2], key=lambda x: fitness[x])
+            p2_idx = max(competitors[2:], key=lambda x: fitness[x])
+            p1 = sorted_pop[p1_idx]
+            p2 = sorted_pop[p2_idx]
+            child = {}
+            for k in p1:
+                alpha = random.random()
+                child[k] = alpha * p1[k] + (1 - alpha) * p2[k]
+                child[k] += torch.randn_like(child[k]) * 0.02
+                child[k] = torch.clamp(child[k], -1.0, 1.0)
+            new_pop.append(child)
+        return new_pop[:20]
+
+    def _grow_architecture(self):
+        for name, module in self.generator.named_modules():
+            if isinstance(module, nn.Linear):
+                if 'weight' in name:
+                    module.out_features = int(module.out_features * 1.1)
