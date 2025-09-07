@@ -1,0 +1,134 @@
+# ===============================================
+# config.py
+# ไฟล์ตั้งค่า CONFIG กลาง ใช้ร่วมกันทุกคลาส
+# สามารถดึงค่าหรือแก้ไขค่าได้แบบเรียลไทม์
+# ===============================================
+
+class GlobalConfig:
+    CONFIG = {
+        # ===============================
+        # API and Exchange Parameters
+        # พารามิเตอร์สำหรับ API และการเชื่อมต่อ Binance
+        # ===============================
+        'binance_api_key': 'YOUR_API_KEY_HERE',            # คีย์ API สำหรับเชื่อมต่อ Binance Futures (ปรับให้เป็นคีย์จริงก่อนใช้งาน)
+        'binance_api_secret': 'YOUR_API_SECRET_HERE',      # รหัสลับ API สำหรับ Binance Futures (ปรับให้เป็นรหัสลับจริงก่อนใช้งาน)
+        'dry_run': False,                                 # True = จำลองการเรียก API และเทรด (ไม่ส่งจริง), False = เรียก API และเทรดจริง
+        'max_api_retries': 10,                             # จำนวนครั้งสูงสุดที่พยายามเรียก API ใหม่เมื่อล้มเหลว
+        'api_timeout': 30,                                 # วินาทีที่รอการตอบกลับจาก API ก่อน timeout
+        'rate_limit_per_minute': 2400,                     # จำนวนคำขอ API ต่อนาที (ตาม Binance Futures ในปี 2025: 2400/min per IP)
+        'margin_mode': 'cross',                            # โหมด margin ('cross' หรือ 'isolated')
+        'min_leverage': 5,                                 # Leverage ขั้นต่ำที่ยอมรับ (ปรับอัตโนมัติแต่ไม่ต่ำกว่านี้)
+        'trailing_callback_rate': 0.5,                     # เปอร์เซ็นต์ callback สำหรับ Trailing Stop และ Take Profit (เช่น 0.5%)
+        'trailing_update_interval': 60,                    # ระยะเวลา (วินาที) สำหรับการอัพเดท Trailing SL/TP อัตโนมัติ
+        'sync_time_interval': 3600,                        # ระยะเวลา (วินาที) สำหรับการซิงค์เวลากับเซิร์ฟเวอร์ Binance
+        'futures_weight': 0.9,                             # น้ำหนักการใช้งาน API สำหรับ Futures (เพื่อ allocate rate limit)
+
+        # ===============================
+        # WebSocket Parameters
+        # พารามิเตอร์สำหรับ WebSocket และการจัดการข้อมูลเรียลไทม์
+        # ===============================
+        'ws_url': 'wss://fstream.binance.com/ws',          # URL หลักสำหรับ WebSocket Market Streams ของ Binance Futures
+        'ws_backup_url': 'wss://stream.binance.com:9443/ws',  # URL สำรองสำหรับ WebSocket
+        'max_reconnects': 10,                              # จำนวนครั้งสูงสุดในการ reconnect ก่อนใช้ข้อมูลสำรอง
+        'reconnect_delay_max': 60,                         # วินาทีสูงสุดในการรอ reconnect
+        'ws_timeout': 10,                                  # วินาที timeout สำหรับการรับข้อความจาก WebSocket
+        'db_path': 'ws_backup.db',                         # Path ของฐานข้อมูล SQLite สำหรับ备份ข้อมูล WebSocket
+        'cache_size_max': 1000,                            # ขนาดสูงสุดของ cache สำหรับข้อมูลล่าสุด
+        'data_retention_limit': 100,                       # จำนวนแถวสูงสุดที่เก็บใน SQLite ต่อ symbol (สำหรับข้อมูลล่าสุด)
+        'multi_tf_list': ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d'],  # รายการ timeframe สำหรับ aggregation
+        'historical_years': 5,                             # จำนวนปีของข้อมูลย้อนหลังสำหรับโหมดจำลอง
+
+        # ===============================
+        # Model Specific Parameters
+        # พารามิเตอร์เฉพาะสำหรับโมเดล AI (เช่น SSD, EvoGAN)
+        # ===============================
+        'min_volatility_threshold': 0.005,                 # ความผันผวนขั้นต่ำที่ยอมรับสำหรับปรับ learning rate (ใช้ใน SSD)
+        'nas_iterations': 100,                             # จำนวน iterations สำหรับ Neural Architecture Search (ใช้ใน EvoGAN)
+
+        # ===============================
+        # Trading and Risk Management Parameters
+        # พารามิเตอร์การเทรดและการบริหารความเสี่ยง
+        # ===============================
+        'profit_lock_percentage': 0.05,                    # เปอร์เซ็นต์กำไรที่ล็อกเมื่อถึงเป้า (เช่น ล็อกกำไรที่ 5%)
+        'loss_strategy': 'dynamic',                        # กลยุทธ์ตัดขาดทุน ('dynamic' = ปรับตาม ATR เพื่อความยืดหยุ่นตามตลาด)
+        'stop_loss_percentage': 0.005,                     # เปอร์เซ็นต์ขาดทุนเริ่มต้น (เช่น 0.5% สำหรับ stop loss เริ่มต้น, ปรับตามกลยุทธ์)
+        'cut_loss_threshold': 0.2,                         # ขีดจำกัดขาดทุนสูงสุด (เป็น fraction เช่น 20% ของทุน)
+        'risk_per_trade': 0.2,                             # ความเสี่ยงต่อการเทรดแต่ละครั้ง (เช่น 20% ของทุน, ปรับตาม KPI เพื่อควบคุม drawdown)
+        'max_drawdown': 0.2,                               # เปอร์เซ็นต์ drawdown สูงสุดที่ยอมรับได้ (เช่น 20% ของทุนรวม)
+        'liquidity_threshold': 1000000,                    # ปริมาณการซื้อขายขั้นต่ำ (หน่วย USDT เพื่อให้แน่ใจว่ามี liquidity เพียงพอ)
+
+        # ===============================
+        # Financial Management Parameters
+        # พารามิเตอร์ด้านการจัดการการเงิน
+        # ===============================
+        'initial_balance': 100,                            # ยอดเงินเริ่มต้นในบัญชี (หน่วย USDT, ใช้สำหรับการคำนวณ reward และ reinvest)
+        'reinvest_profits': True,                          # True = นำกำไรมา reinvest เพื่อทบต้นทุน, False = ไม่ reinvest (เก็บกำไรแยก)
+
+        # ===============================
+        # Simulation Mode Parameters
+        # พารามิเตอร์สำหรับโหมดจำลอง (dry_run)
+        # ===============================
+        'sim_volatility': 0.02,                            # ความผันผวนในโหมดจำลอง (เช่น 2% สำหรับการสุ่มราคา)
+        'sim_trend': 0.001,                                # แนวโน้มราคาในโหมดจำลอง (เช่น 0.1% ต่อ step สำหรับการจำลอง uptrend/downtrend)
+        'sim_spike_chance': 0.05,                          # โอกาสเกิดการพุ่งของราคาในโหมดจำลอง (เช่น 5% โอกาส spike)
+
+        # ===============================
+        # Model Training and Optimization Parameters
+        # พารามิเตอร์ฝึกโมเดล AI และการปรับแต่ง
+        # ===============================
+        'auto_ml_interval': 500,                           # จำนวน steps ก่อนฝึก ML อัตโนมัติ (เช่น ทุก 500 steps เพื่อปรับ hyperparameter)
+        'rl_train_interval': 200,                          # จำนวน steps ก่อนฝึก Reinforcement Learning (เช่น ทุก 200 steps เพื่ออัพเดท policy)
+        'checkpoint_interval': 360,                        # จำนวน steps ก่อนบันทึก checkpoint (เช่น ทุก 360 steps หรือ 6 ชั่วโมง)
+        'bayes_opt_steps': 10,                             # จำนวน iterations สำหรับ Bayesian Optimization (เพื่อหา hyperparameter ที่ดีที่สุด)
+        'gnn_update_interval': 900,                        # วินาทีที่อัพเดท GNN graph (เช่น ทุก 15 นาที เพื่อวิเคราะห์ความสัมพันธ์เหรียญ)
+        'madrl_agent_count': 50,                           # จำนวน agent สูงสุดใน MADRL (ตามจำนวนเหรียญที่เทรด เพื่อจัดการ multi-agent)
+        'max_coins_per_trade': 15,                         # จำนวนเหรียญสูงสุดที่เทรดพร้อมกัน (เพื่อจำกัด portfolio size)
+        'min_coins_per_trade': 6,                          # จำนวนเหรียญขั้นต่ำที่เทรดพร้อมกัน (เพื่อกระจายความเสี่ยง)
+        'maml_lr_inner': 0.01,                             # Learning rate ภายในสำหรับ MAML (เพื่อ fine-tuning รวดเร็ว)
+        'maml_lr_outer': 0.001,                            # Learning rate ภายนอกสำหรับ MAML (เพื่ออัพเดท meta-model)
+        'maml_steps': 5,                                   # จำนวน steps สำหรับ fine-tuning ใน MAML (เพื่อการเรียนรู้แบบ few-shot)
+
+        # ===============================
+        # KPI and Performance Parameters
+        # พารามิเตอร์เกี่ยวกับ KPI และประสิทธิภาพ
+        # ===============================
+        'target_kpi_daily': 100000.0,                      # เป้าหมายกำไรรายวัน (หน่วย USDT, เพื่อวัดประสิทธิภาพระบบ)
+        'min_daily_kpi': 50000.0,                          # เป้าหมายกำไรขั้นต่ำระหว่างวัน (50% ของ target เพื่อ trigger การปรับกลยุทธ์)
+
+        # ===============================
+        # Resource and Bug Management Parameters
+        # พารามิเตอร์การจัดการทรัพยากรและบั๊ก
+        # ===============================
+        'auto_bug_fix': True,                              # True = แก้บั๊กอัตโนมัติเมื่อเกิดข้อผิดพลาด (เช่น CUDA OOM หรือ rate limit)
+        'bug_fix_attempts': 5,                             # จำนวนครั้งสูงสุดที่พยายามแก้บั๊ก (ก่อนหยุดระบบ)
+        'resource_adaptive': True,                         # True = ปรับการใช้ทรัพยากร (CPU/RAM) อัตโนมัติ (เพื่อป้องกัน overload)
+        'min_ram_reserve_mb': 1024,                        # จำนวน MB ของ RAM ที่สำรองไว้ (เพื่อป้องกัน memory error)
+        'min_cpu_idle_percent': 20,                        # เปอร์เซ็นต์ CPU ว่างขั้นต่ำ (เพื่อป้องกัน CPU overload)
+
+        # ===============================
+        # System Status and Logging
+        # พารามิเตอร์เกี่ยวกับสถานะระบบและการบันทึก
+        # ===============================
+        'system_running': False,                           # สถานะการรันระบบ (True = ทำงาน, False = หยุด)
+        'trade_log_file': 'trade_log.xlsx',                # ไฟล์บันทึกการเทรด (สำหรับบันทึก transaction history)
+        'log_level': 'INFO',                               # ระดับการบันทึก log ('DEBUG', 'INFO', 'WARNING', 'ERROR') สำหรับระบบโดยรวม
+    }
+
+    @classmethod
+    def get(cls, key: str, default=None):
+        """
+        ดึงค่าจาก CONFIG
+        :param key: str → ชื่อคีย์ที่ต้องการดึงค่า
+        :param default: ค่าเริ่มต้น ถ้าไม่พบ key
+        """
+        return cls.CONFIG.get(key, default)
+
+    @classmethod
+    def set(cls, key: str, value):
+        """
+        เปลี่ยนค่าของ CONFIG แบบเรียลไทม์
+        :param key: str → ชื่อคีย์ที่ต้องการแก้ไข
+        :param value: ค่าใหม่ที่ต้องการตั้ง
+        """
+        cls.CONFIG[key] = value
+        logging.info(f"อัพเดทค่า CONFIG: {key} เป็น {value}")
