@@ -81,9 +81,19 @@ async def main():
                 strategy = await strategy_gen.generate_strategy(state.reshape(1, -1), symbol, volatility)
                 strategy['size'] *= risk_weights.get(symbol, GlobalConfig.get('risk_per_trade'))
                 profit = await strategy_gen.execute_strategy(strategy)
-                multi_tf_data = {tf: env.multi_tf_data[tf].get(symbol, pd.DataFrame()).to_dict() for tf in GlobalConfig.get('multi_tf_list', [])}
-                trader.replay_buffer.add(state, np.argmax(trader.predict(state.reshape(1, -1))[0]), 
-                                       trader.predict(state.reshape(1, -1))[1][0], profit, observation[i], None, None, volatility, multi_tf_data)
+                multi_tf_data = {tf: env.multi_tf_data[tf].get(symbol, pd.DataFrame()).to_dict()
+                                 for tf in GlobalConfig.get('multi_tf_list', [])}
+                trader.replay_buffer.add(
+                    state,
+                    np.argmax(trader.predict(state.reshape(1, -1))[0]),
+                    trader.predict(state.reshape(1, -1))[1][0],
+                    profit,
+                    observation[i],
+                    None,
+                    None,
+                    volatility,
+                    multi_tf_data
+                )
                 await trader.evolve(state.reshape(1, -1), profit, volatility)
 
             # ฝึกโมเดลตาม interval
@@ -102,6 +112,7 @@ async def main():
 
             step_count += 1
             await asyncio.sleep(60)
+
         except Exception as e:
             if await bug_fixer.analyze_and_fix(e, trader, env):
                 logging.info("แก้ไขบั๊กสำเร็จ ทำงานต่อ")
@@ -113,6 +124,7 @@ async def main():
 
     # ยกเลิก control_task เมื่อหยุดระบบ
     control_task.cancel()
-            
-            if __name__ == "__main__":
-            asyncio.run(main())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
