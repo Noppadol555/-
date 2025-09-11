@@ -1,0 +1,3 @@
+if __name__ == "__main__":
+    auto_install_all()
+    asyncio.run(main())
