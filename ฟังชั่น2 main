@@ -113,3 +113,6 @@ async def main():
 
     # ยกเลิก control_task เมื่อหยุดระบบ
     control_task.cancel()
+            
+            if __name__ == "__main__":
+            asyncio.run(main())
