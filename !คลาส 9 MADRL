@@ -8,14 +8,26 @@ import numpy as np
 from collections import deque
 
 class MADRL:
-    def __init__(self, state_dim, action_dim, num_agents=CONFIG['madrl_agent_count'], symbols=None):
+    """
+    Multi-Agent Deep Reinforcement Learning (MADRL) สำหรับการเทรดหลายเหรียญ
+    ใช้ Actor-Critic architecture กับ multi-agent สำหรับจัดการ portfolio
+    """
+
+    def __init__(self, state_dim, action_dim, num_agents=None, symbols=None):
+        """
+        เริ่มต้นคลาส MADRL
+        :param state_dim: int → ขนาดของ state (เช่น จำนวน features ต่อ agent)
+        :param action_dim: int → ขนาดของ action (เช่น leverage หรือ position size)
+        :param num_agents: int → จำนวน agent (default จาก CONFIG['madrl_agent_count'])
+        :param symbols: list → รายการ symbols (เช่น ['BTCUSDT', 'ETHUSDT'])
+        """
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # ตรวจสอบ GPU อัตโนมัติ
         if torch.cuda.is_available():
             prop = torch.cuda.get_device_properties(0)
             if '5070 Ti' in prop.name:
                 print(f"Detected RTX 5070 Ti with CUDA capability {prop.major}.{prop.minor}")
-        self.num_agents = min(num_agents, CONFIG['madrl_agent_count'])
+        self.num_agents = min(num_agents or CONFIG['madrl_agent_count'], CONFIG['madrl_agent_count'])
         self.symbols = symbols or []
         self.max_actions = [CONFIG['max_leverage_per_symbol'].get(s, 125) for s in self.symbols]
         self.actors = [nn.Sequential(
@@ -56,41 +68,178 @@ class MADRL:
         self.confidence_history = deque(maxlen=50)
 
     def act(self, states):
-        states = torch.FloatTensor(states).to(self.device)
-        actions = [self.actors[i](states[i]).cpu().detach().numpy() * self.max_actions[i] for i in range(self.num_agents)]
-        return np.clip(np.array(actions), CONFIG['min_leverage'], self.max_actions)
+        """
+        สร้าง action จาก states ปัจจุบัน
+        :param states: list of np.array → states สำหรับแต่ละ agent (shape: [num_agents, state_dim])
+        :return: np.array → actions ที่ clip แล้ว (shape: [num_agents, action_dim])
+        """
+        if len(states) != self.num_agents:
+            raise ValueError(f"จำนวน states ({len(states)}) ไม่ตรงกับ num_agents ({self.num_agents})")
+        states_tensor = torch.FloatTensor(states).to(self.device)
+        actions = [self.actors[i](states_tensor[i]).cpu().detach().numpy() * self.max_actions[i] for i in range(self.num_agents)]
+        actions_array = np.array(actions)
+        return np.clip(actions_array, CONFIG['min_leverage'], self.max_actions)
 
     def train(self, state_batch, action_batch, reward_batch, next_state_batch):
+        """
+        ฝึกโมเดลด้วย batch ของข้อมูล
+        :param state_batch: np.array → states (shape: [batch_size, num_agents, state_dim])
+        :param action_batch: np.array → actions (shape: [batch_size, num_agents, action_dim])
+        :param reward_batch: np.array → rewards (shape: [batch_size, 1])
+        :param next_state_batch: np.array → next states (shape: [batch_size, num_agents, state_dim])
+        """
+        if len(state_batch) != len(action_batch) or len(state_batch) != len(reward_batch) or len(state_batch) != len(next_state_batch):
+            raise ValueError("Batch ขนาดไม่ตรงกัน")
+        
         state_batch = torch.FloatTensor(state_batch).to(self.device)
         action_batch = torch.FloatTensor(action_batch).to(self.device)
         reward_batch = torch.FloatTensor(reward_batch).unsqueeze(1).to(self.device)
         next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
-        next_actions = torch.stack([self.actor_targets[i](next_state_batch[i]) for i in range(self.num_agents)])
-        critic_input = torch.cat([state_batch.view(-1), action_batch.view(-1)], dim=0)
-        next_critic_input = torch.cat([next_state_batch.view(-1), next_actions.view(-1)], dim=0)
-        target_q = self.critic_target(next_critic_input) + 0.99 * reward_batch
+        
+        # คำนวณ next_actions จาก target actors
+        next_actions_list = [self.actor_targets[i](next_state_batch[:, i, :]) for i in range(self.num_agents)]
+        next_actions = torch.stack(next_actions_list, dim=1)  # [batch_size, num_agents, action_dim]
+        
+        # เตรียม input สำหรับ critic (flatten across agents)
+        critic_input = torch.cat([state_batch.view(state_batch.size(0), -1), 
+                                  action_batch.view(action_batch.size(0), -1)], dim=1)
+        next_critic_input = torch.cat([next_state_batch.view(next_state_batch.size(0), -1), 
+                                       next_actions.view(next_actions.size(0), -1)], dim=1)
+        
+        # คำนวณ target Q-value
+        target_q = reward_batch + 0.99 * self.critic_target(next_critic_input)
         current_q = self.critic(critic_input)
         critic_loss = nn.MSELoss()(current_q, target_q.detach())
+        
+        # อัพเดท critic
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
+        
+        # อัพเดท actors
         for i in range(self.num_agents):
-            actions_pred = self.actors[i](state_batch[i])
-            actor_loss = -self.critic(torch.cat([state_batch.view(-1), actions_pred.view(-1)], dim=0)).mean()
+            actions_pred = self.actors[i](state_batch[:, i, :])  # [batch_size, action_dim]
+            # สร้าง input สำหรับ actor loss (ใช้ actions จาก agent นี้และ actions อื่นจาก batch)
+            # สำหรับ simplicity, ใช้ average หรือ full concat แต่ปรับให้ถูกต้อง
+            # ที่นี่ใช้ concat กับ dummy actions สำหรับ agents อื่น (ปรับจาก original)
+            other_actions = action_batch[:, :i, :].view(action_batch.size(0), -1)
+            this_actions_exp = actions_pred.unsqueeze(1).expand(-1, i, -1).view(action_batch.size(0), -1) if i > 0 else torch.zeros(action_batch.size(0), 0).to(self.device)
+            post_actions = action_batch[:, i+1:, :].view(action_batch.size(0), -1)
+            actor_input = torch.cat([state_batch.view(state_batch.size(0), -1), 
+                                     torch.cat([other_actions, this_actions_exp, post_actions], dim=1)], dim=1)
+            actor_loss = -self.critic(actor_input).mean()
+            
             self.actor_optimizers[i].zero_grad()
             actor_loss.backward()
             self.actor_optimizers[i].step()
+        
+        # Soft update targets
+        tau = 0.001
         for i in range(self.num_agents):
             for t_param, param in zip(self.actor_targets[i].parameters(), self.actors[i].parameters()):
-                t_param.data.copy_(0.001 * param.data + 0.999 * t_param.data)
+                t_param.data.copy_(tau * param.data + (1 - tau) * t_param.data)
         for t_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
-            t_param.data.copy_(0.001 * param.data + 0.999 * t_param.data)
+            t_param.data.copy_(tau * param.data + (1 - tau) * t_param.data)
+        
         self.confidence_history.append(1 / (critic_loss.item() + 1e-6))
 
     def update_symbols(self, new_symbols):
+        """
+        อัพเดท symbols และปรับ num_agents ใหม่
+        :param new_symbols: list → รายการ symbols ใหม่
+        """
         self.symbols = new_symbols
+        old_num = self.num_agents
         self.num_agents = min(len(new_symbols), CONFIG['madrl_agent_count'])
         self.max_actions = [CONFIG['max_leverage_per_symbol'].get(s, 125) for s in self.symbols]
-        self.actors = self.actors[:self.num_agents]
-        self.actor_targets = self.actor_targets[:self.num_agents]
-        self.actor_optimizers = self.actor_optimizers[:self.num_agents]
+        
+        # Trim actors ถ้า num_agents ลดลง
+        if self.num_agents < old_num:
+            self.actors = self.actors[:self.num_agents]
+            self.actor_targets = self.actor_targets[:self.num_agents]
+            self.actor_optimizers = self.actor_optimizers[:self.num_agents]
+        # ถ้าเพิ่ม ต้องสร้างใหม่ (แต่ที่นี่ assume ไม่เพิ่มเกิน limit)
+        elif self.num_agents > old_num:
+            # สร้างเพิ่ม
+            for _ in range(old_num, self.num_agents):
+                actor = nn.Sequential(
+                    nn.Linear(CONFIG.get('state_dim', 10), 256),  # assume default
+                    nn.ReLU(),
+                    nn.Linear(256, 128),
+                    nn.ReLU(),
+                    nn.Linear(128, CONFIG.get('action_dim', 1)),  # assume default
+                    nn.Tanh()
+                ).to(self.device)
+                self.actors.append(actor)
+                actor_target = nn.Sequential(
+                    nn.Linear(CONFIG.get('state_dim', 10), 256),
+                    nn.ReLU(),
+                    nn.Linear(256, 128),
+                    nn.ReLU(),
+                    nn.Linear(128, CONFIG.get('action_dim', 1)),
+                    nn.Tanh()
+                ).to(self.device)
+                self.actor_targets.append(actor_target)
+                self.actor_optimizers.append(optim.Adam(actor.parameters(), lr=0.0001))
+                actor_target.load_state_dict(actor.state_dict())
+            
+            # อัพเดท critic ถ้าจำเป็น (recreate ถ้า dim เปลี่ยน)
+            self._rebuild_critic(CONFIG.get('state_dim', 10), CONFIG.get('action_dim', 1))
+    
+    def _rebuild_critic(self, state_dim, action_dim):
+        """Rebuild critic ถ้า num_agents เปลี่ยน"""
+        input_dim = state_dim * self.num_agents + action_dim * self.num_agents
+        self.critic = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        ).to(self.device)
+        self.critic_target = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        ).to(self.device)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=0.001)
+
+    def get_confidence(self):
+        """
+        ดึงค่า confidence ล่าสุด (1 / loss)
+        :return: float → confidence score ล่าสุด
+        """
+        return np.mean(list(self.confidence_history)) if self.confidence_history else 0.0
+
+    def save_model(self, path):
+        """
+        บันทึกโมเดล
+        :param path: str → path สำหรับบันทึก
+        """
+        torch.save({
+            'actors': [actor.state_dict() for actor in self.actors],
+            'critic': self.critic.state_dict(),
+            'actor_targets': [target.state_dict() for target in self.actor_targets],
+            'critic_target': self.critic_target.state_dict(),
+            'symbols': self.symbols,
+            'num_agents': self.num_agents
+        }, path)
+
+    def load_model(self, path):
+        """
+        โหลดโมเดล
+        :param path: str → path สำหรับโหลด
+        """
+        checkpoint = torch.load(path, map_location=self.device)
+        for i, actor in enumerate(self.actors):
+            if i < len(checkpoint['actors']):
+                actor.load_state_dict(checkpoint['actors'][i])
+        self.critic.load_state_dict(checkpoint['critic'])
+        for i, target in enumerate(self.actor_targets):
+            if i < len(checkpoint['actor_targets']):
+                target.load_state_dict(checkpoint['actor_targets'][i])
+        self.critic_target.load_state_dict(checkpoint['critic_target'])
+        self.symbols = checkpoint.get('symbols', self.symbols)
+        self.num_agents = checkpoint.get('num_agents', self.num_agents)
