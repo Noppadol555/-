@@ -1,7 +1,11 @@
-# คลาสที่ 2: WebSocketManager
+# ===============================================
+# websocket_manager.py
+# คลาสจัดการ WebSocket สำหรับข้อมูลเรียลไทม์จาก Binance Futures
+# ใช้ Config กลางจาก config.py เท่านั้น
+# ===============================================
 
 # ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
-# pip install websockets aiohttp sqlite3 ccxt.async_support
+# pip install websockets aiohttp sqlite3 ccxt.async_support tenacity
 
 import json
 import asyncio
@@ -14,10 +18,11 @@ from collections import deque
 from datetime import datetime, timedelta
 import aiohttp
 from tenacity import retry, wait_exponential, stop_after_attempt
+from config import GlobalConfig  # ดึง GlobalConfig จาก config.py
 
 # การตั้งค่าระบบบันทึก log เฉพาะสำหรับคลาสนี้
 logging.basicConfig(
-    level=getattr(logging, GlobalConfig.get('log_level')),
+    level=getattr(logging, GlobalConfig.get('log_level', 'INFO')),
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.handlers.RotatingFileHandler('websocketmanager.log', maxBytes=10*1024*1024, backupCount=5),
@@ -42,54 +47,80 @@ class WebSocketManager:
         self.cache = {}  # Cache สำหรับข้อมูลล่าสุด
         self.all_usdt_pairs = []
         self.db_conn = sqlite3.connect(GlobalConfig.get('db_path'), timeout=10)
-        self.db_conn.execute("CREATE TABLE IF NOT EXISTS ws_data (symbol TEXT, timestamp REAL, close REAL, volume REAL, funding_rate REAL, depth REAL)")
-        self.db_conn.execute("CREATE TABLE IF NOT EXISTS historical_data (symbol TEXT, timestamp REAL, open REAL, high REAL, low REAL, close REAL, volume REAL)")
-        self.balance_data = {'free': 0, 'locked': 0}  # เก็บยอดเงินเรียลไทม์
+        cursor = self.db_conn.cursor()
+        cursor.execute("CREATE TABLE IF NOT EXISTS ws_data (symbol TEXT, timestamp REAL, close REAL, volume REAL, funding_rate REAL, depth REAL)")
+        cursor.execute("CREATE TABLE IF NOT EXISTS historical_data (symbol TEXT, timestamp REAL, open REAL, high REAL, low REAL, close REAL, volume REAL)")
+        self.db_conn.commit()
+        self.balance_data = {'free': GlobalConfig.get('initial_balance', 100), 'locked': 0}  # เก็บยอดเงินเรียลไทม์
         self.position_data = {}  # เก็บข้อมูลตำแหน่งเรียลไทม์
         self.exchange = exchange  # อ้างอิง exchange จาก APIManager
         self.time_offset = time_offset  # ใช้ time_offset จาก APIManager
-        self.multi_tf_data = {tf: deque(maxlen=1000) for tf in GlobalConfig.get('multi_tf_list')}  # เก็บ OHLCV aggregate ตาม timeframe
-        self.last_aggregate_time = {tf: time.time() for tf in GlobalConfig.get('multi_tf_list')}  # เวลา aggregate ล่าสุดต่อ timeframe
+        self.multi_tf_data = {tf: deque(maxlen=1000) for tf in GlobalConfig.get('multi_tf_list', [])}  # เก็บ OHLCV aggregate ตาม timeframe
+        self.last_aggregate_time = {tf: time.time() for tf in GlobalConfig.get('multi_tf_list', [])}  # เวลา aggregate ล่าสุดต่อ timeframe
+        self.listen_key = None  # สำหรับ user stream
+
+    async def create_listen_key(self):
+        """สร้าง listenKey สำหรับ user stream"""
+        if self.listen_key or not self.exchange:
+            return self.listen_key
+        try:
+            response = await self.exchange.private_futures_start_user_stream()
+            self.listen_key = response['listenKey']
+            logging.info(f"สร้าง listenKey สำเร็จ: {self.listen_key[:10]}...")
+            return self.listen_key
+        except Exception as e:
+            logging.error(f"สร้าง listenKey ล้มเหลว: {e}")
+            return None
+
+    async def keep_alive_loop(self):
+        """ลูป keep alive user stream ทุก 30 นาที"""
+        while self.running:
+            await asyncio.sleep(1800)  # 30 นาที
+            if self.listen_key and self.exchange:
+                try:
+                    await self.exchange.private_futures_keep_alive_user_stream({'listenKey': self.listen_key})
+                    logging.debug("keep alive user stream สำเร็จ")
+                except Exception as e:
+                    logging.error(f"keep alive user stream ล้มเหลว: {e}")
 
     async def fetch_all_usdt_pairs(self):
         """ดึงรายการคู่เหรียญ USDT ทั้งหมดจาก Binance Futures"""
         try:
-            markets = await self.exchange.load_markets(params={'timestamp': await self.exchange.get_adjusted_timestamp(), 'recvWindow': 5000})
-            self.all_usdt_pairs = [s for s in markets.keys() if s.endswith('/USDT') and markets[s]['contract']]
+            markets = await self.exchange.load_markets()
+            self.all_usdt_pairs = [s for s in markets if s.endswith('USDT') and markets[s].get('swap', False)]
             logging.info(f"ดึงคู่ USDT ทั้งหมด: {len(self.all_usdt_pairs)} เหรียญ")
         except Exception as e:
             logging.error(f"ดึงคู่ USDT ล้มเหลว: {e}")
-            self.all_usdt_pairs = ['BTC/USDT', 'ETH/USDT']  # ค่า default
+            self.all_usdt_pairs = ['BTCUSDT', 'ETHUSDT']  # ค่า default
 
-    async def load_historical_data(self, symbol, years=GlobalConfig.get('historical_years')):
+    async def load_historical_data(self, symbol, years=GlobalConfig.get('historical_years', 5)):
         """โหลดข้อมูลย้อนหลังสำหรับโหมดจำลอง"""
         years_ago = datetime.utcnow() - timedelta(days=365 * years)
-        with self.db_conn:
-            cursor = self.db_conn.execute(
-                "SELECT timestamp, open, high, low, close, volume FROM historical_data WHERE symbol=? AND timestamp>=? ORDER BY timestamp ASC",
-                (symbol, years_ago.timestamp())
-            )
-            data = cursor.fetchall()
-            if len(data) < 1000:  # สมมติ limit สำหรับ historical
-                try:
-                    klines = await self.exchange.fetch_ohlcv(symbol, '1h', since=int(years_ago.timestamp() * 1000), limit=1000,
-                                                           params={'timestamp': await self.exchange.get_adjusted_timestamp(), 'recvWindow': 5000})
-                    for kline in klines:
-                        timestamp, open_p, high, low, close, volume = kline
-                        self.db_conn.execute(
-                            "INSERT OR IGNORE INTO historical_data (symbol, timestamp, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (symbol, timestamp / 1000, open_p, high, low, close, volume)
-                        )
-                    self.db_conn.commit()
-                    logging.info(f"โหลดข้อมูลย้อนหลัง {years} ปีสำหรับ {symbol} สำเร็จ")
-                    cursor = self.db_conn.execute(
-                        "SELECT timestamp, open, high, low, close, volume FROM historical_data WHERE symbol=? ORDER BY timestamp ASC",
-                        (symbol,)
+        cursor = self.db_conn.cursor()
+        cursor.execute(
+            "SELECT timestamp, open, high, low, close, volume FROM historical_data WHERE symbol=? AND timestamp>=? ORDER BY timestamp ASC",
+            (symbol, years_ago.timestamp())
+        )
+        data = cursor.fetchall()
+        if len(data) < 1000:  # สมมติ limit สำหรับ historical
+            try:
+                klines = await self.exchange.fetch_ohlcv(symbol, '1h', since=int(years_ago.timestamp() * 1000), limit=1000)
+                for kline in klines:
+                    timestamp, open_p, high, low, close, volume = kline
+                    self.db_conn.execute(
+                        "INSERT OR IGNORE INTO historical_data (symbol, timestamp, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (symbol, timestamp / 1000, open_p, high, low, close, volume)
                     )
-                    data = cursor.fetchall()
-                except Exception as e:
-                    logging.error(f"ดึงข้อมูลย้อนหลังสำหรับ {symbol} ล้มเหลว: {e}")
-                    data = [(time.time() - i*3600, 10000, 10100, 9900, 10000, 100) for i in range(1000)]  # จำลองข้อมูล
+                self.db_conn.commit()
+                logging.info(f"โหลดข้อมูลย้อนหลัง {years} ปีสำหรับ {symbol} สำเร็จ")
+                cursor.execute(
+                    "SELECT timestamp, open, high, low, close, volume FROM historical_data WHERE symbol=? ORDER BY timestamp ASC",
+                    (symbol,)
+                )
+                data = cursor.fetchall()
+            except Exception as e:
+                logging.error(f"ดึงข้อมูลย้อนหลังสำหรับ {symbol} ล้มเหลว: {e}")
+                data = [(time.time() - i*3600, 10000, 10100, 9900, 10000, 100) for i in range(1000)]  # จำลองข้อมูล
         return data
 
     async def aggregate_to_timeframe(self, symbol, tf, new_data):
@@ -97,15 +128,14 @@ class WebSocketManager:
         tf_seconds = self._tf_to_seconds(tf)
         current_time = time.time()
         if current_time - self.last_aggregate_time[tf] >= tf_seconds:
-            if symbol in self.data:
-                close = new_data.get('close', self.data[symbol].get('close', 0))
-                volume = new_data.get('volume', self.data[symbol].get('volume', 0))
-                open_p = self.multi_tf_data[tf][-1][1] if self.multi_tf_data[tf] else close
-                high = max(open_p, close)
-                low = min(open_p, close)
-                self.multi_tf_data[tf].append((current_time, open_p, high, low, close, volume))
-                self.last_aggregate_time[tf] = current_time
-                logging.debug(f"Aggregated data for {symbol} in {tf}")
+            close = new_data.get('close', 0)
+            volume = new_data.get('volume', 0)
+            open_p = self.multi_tf_data[tf][-1][1] if self.multi_tf_data[tf] else close
+            high = max(open_p, close)
+            low = min(open_p, close)
+            self.multi_tf_data[tf].append((current_time, open_p, high, low, close, volume))
+            self.last_aggregate_time[tf] = current_time
+            logging.debug(f"Aggregated data for {symbol} in {tf}")
 
     def _tf_to_seconds(self, tf):
         """แปลง timeframe เป็นวินาที"""
@@ -116,7 +146,7 @@ class WebSocketManager:
 
     async def update_symbols(self, symbols):
         """อัพเดทรายการ symbols ที่สมัครรับข้อมูล"""
-        new_symbols = [s.lower().replace('/', '') + '@ticker' for s in symbols]
+        new_symbols = [s.lower() + '@ticker' for s in symbols]
         if set(new_symbols) != self.subscribed_symbols:
             self.subscribed_symbols = set(new_symbols[:1024])  # Binance limit 1024 streams
             if self.running:
@@ -125,20 +155,26 @@ class WebSocketManager:
     async def resubscribe(self, websocket=None):
         """สมัครรับข้อมูล WebSocket ใหม่"""
         if websocket:
+            await self.create_listen_key()
+            if self.listen_key:
+                params = [f"{self.listen_key}@arr"] + list(self.subscribed_symbols)
+            else:
+                params = list(self.subscribed_symbols)
             await websocket.send(json.dumps({
                 'method': 'SUBSCRIBE',
-                'params': ['!userData@arr'] + list(self.subscribed_symbols),
+                'params': params,
                 'id': 1
             }))
             logging.info(f"สมัครรับข้อมูลใหม่: {len(self.subscribed_symbols)} streams")
 
-    @retry(wait=wait_exponential(multiplier=1, min=4, max=GlobalConfig.get('reconnect_delay_max')), stop=stop_after_attempt(GlobalConfig.get('max_reconnects')))
+    @retry(wait=wait_exponential(multiplier=1, min=4, max=GlobalConfig.get('reconnect_delay_max', 60)), stop=stop_after_attempt(GlobalConfig.get('max_reconnects', 10)))
     async def start(self, symbols):
         """เริ่มต้น WebSocket และรับข้อมูลเรียลไทม์"""
         if not self.all_usdt_pairs:
             await self.fetch_all_usdt_pairs()
         await self.update_symbols(symbols)
         self.running = True
+        asyncio.create_task(self.keep_alive_loop())
         urls = [self.url, self.backup_url]
         current_url_idx = 0
         while self.running:
@@ -147,7 +183,7 @@ class WebSocketManager:
                     await self.resubscribe(websocket)
                     self.reconnect_attempts = 0
                     while self.running:
-                        message = await asyncio.wait_for(websocket.recv(), timeout=GlobalConfig.get('ws_timeout'))
+                        message = await asyncio.wait_for(websocket.recv(), timeout=GlobalConfig.get('ws_timeout', 10))
                         data = json.loads(message)
                         await self._handle_message(data, websocket)
             except (websockets.ConnectionClosed, asyncio.TimeoutError) as e:
@@ -157,7 +193,7 @@ class WebSocketManager:
                     logging.error("WebSocket ล้มเหลวเกินจำกัด ใช้ข้อมูลสำรอง")
                     await self.use_fallback_data(symbols)
                     break
-                await asyncio.sleep(min(5 * self.reconnect_attempts, GlobalConfig.get('reconnect_delay_max')))
+                await asyncio.sleep(min(5 * self.reconnect_attempts, GlobalConfig.get('reconnect_delay_max', 60)))
                 current_url_idx = (current_url_idx + 1) % len(urls)
             except Exception as e:
                 logging.error(f"ข้อผิดพลาดใน WebSocket: {e}")
@@ -165,6 +201,12 @@ class WebSocketManager:
 
     async def stop(self):
         """หยุด WebSocket และปิดฐานข้อมูลอย่างปลอดภัย"""
+        if self.listen_key and self.exchange:
+            try:
+                await self.exchange.private_futures_close_user_stream({'listenKey': self.listen_key})
+                logging.info("ปิด user stream สำเร็จ")
+            except Exception as e:
+                logging.error(f"ปิด user stream ล้มเหลว: {e}")
         self.running = False
         self.db_conn.close()
         logging.info("หยุด WebSocket และปิดฐานข้อมูลอย่างปลอดภัย")
@@ -184,66 +226,70 @@ class WebSocketManager:
                     'close': float(data.get('c', 0)),
                     'volume': float(data.get('v', 0)),
                     'timestamp': (data.get('E', int(time.time() * 1000)) + self.time_offset) / 1000,
-                    'funding_rate': float(data.get('r', 0.0001)),
-                    'depth': float(data.get('b', 0)) - float(data.get('a', 0))
+                    'funding_rate': 0.0001,  # Default เนื่องจาก ticker ไม่มี funding_rate
+                    'depth': float(data.get('a', 0)) - float(data.get('b', 0))  # Spread จาก ask - bid
                 }
                 self._update_data(symbol, new_data)
                 await self.save_to_sqlite(new_data, symbol)
-                for tf in GlobalConfig.get('multi_tf_list'):
+                for tf in GlobalConfig.get('multi_tf_list', []):
                     await self.aggregate_to_timeframe(symbol, tf, new_data)
 
     def _update_balance(self, data):
         """อัพเดทยอดเงินจาก WebSocket"""
-        asset = data.get('a', {}).get('B', [{}])[0].get('a', 'USDT')
-        if asset == 'USDT':
-            self.balance_data = {
-                'free': float(data.get('a', {}).get('B', [{}])[0].get('wb', 0)),
-                'locked': float(data.get('a', {}).get('B', [{}])[0].get('cw', 0)) - float(data.get('a', {}).get('B', [{}])[0].get('wb', 0))
-            }
-            logging.debug(f"อัพเดทยอดเงิน USDT: free={self.balance_data['free']}, locked={self.balance_data['locked']}")
+        balances = data.get('a', {}).get('B', [])
+        for bal in balances:
+            if bal.get('a') == 'USDT':
+                self.balance_data = {
+                    'free': float(bal.get('wb', 0)),
+                    'locked': float(bal.get('cw', 0)) - float(bal.get('wb', 0))
+                }
+                logging.debug(f"อัพเดทยอดเงิน USDT: free={self.balance_data['free']}, locked={self.balance_data['locked']}")
+                break
 
     def _update_position(self, data):
         """อัพเดทข้อมูลตำแหน่งจาก WebSocket"""
         positions = data.get('a', {}).get('P', [])
         for pos in positions:
             symbol = pos.get('s')
-            if symbol:
+            if symbol and float(pos.get('pa', 0)) != 0:
+                leverage = GlobalConfig.get('max_leverage_per_symbol', {}).get(symbol, 125)
                 self.position_data[symbol] = {
                     'size': float(pos.get('pa', 0)),
                     'entryPrice': float(pos.get('ep', 0)),
-                    'leverage': float(pos.get('l', 1)),
-                    'marginMode': pos.get('mt', 'cross').lower()
+                    'leverage': leverage,
+                    'marginMode': pos.get('mt', 'cross')
                 }
-                logging.debug(f"อัพเดทตำแหน่ง {symbol}: size={self.position_data[symbol]['size']}, leverage={self.position_data[symbol]['leverage']}")
+                logging.debug(f"อัพเดทตำแหน่ง {symbol}: size={self.position_data[symbol]['size']}, leverage={leverage}")
 
     def _update_data(self, symbol, new_data):
         """อัพเดทข้อมูลเรียลไทม์ใน cache"""
         self.data[symbol] = new_data
         self.cache[symbol] = self.data[symbol]
-        if len(self.cache) > GlobalConfig.get('cache_size_max'):
+        if len(self.cache) > GlobalConfig.get('cache_size_max', 1000):
             self.cache.pop(next(iter(self.cache)))
 
     async def save_to_sqlite(self, data, symbol):
         """บันทึกข้อมูล WebSocket ลง SQLite"""
-        with self.db_conn:
-            self.db_conn.execute(
-                "INSERT INTO ws_data (symbol, timestamp, close, volume, funding_rate, depth) VALUES (?, ?, ?, ?, ?, ?)",
-                (symbol, data['timestamp'], data['close'], data['volume'], data['funding_rate'], data['depth'])
-            )
-            self.db_conn.execute(
-                "DELETE FROM ws_data WHERE symbol=? AND timestamp NOT IN (SELECT timestamp FROM ws_data WHERE symbol=? ORDER BY timestamp DESC LIMIT ?)",
-                (symbol, symbol, GlobalConfig.get('data_retention_limit'))
-            )
-            self.db_conn.commit()
+        cursor = self.db_conn.cursor()
+        cursor.execute(
+            "INSERT INTO ws_data (symbol, timestamp, close, volume, funding_rate, depth) VALUES (?, ?, ?, ?, ?, ?)",
+            (symbol, data['timestamp'], data['close'], data['volume'], data['funding_rate'], data['depth'])
+        )
+        limit = GlobalConfig.get('data_retention_limit', 100)
+        cursor.execute(
+            "DELETE FROM ws_data WHERE symbol=? AND timestamp NOT IN (SELECT timestamp FROM ws_data WHERE symbol=? ORDER BY timestamp DESC LIMIT ?)",
+            (symbol, symbol, limit)
+        )
+        self.db_conn.commit()
 
     async def fetch_backup_data(self, symbol):
         """ดึงข้อมูลสำรองจาก SQLite"""
-        with self.db_conn:
-            cursor = self.db_conn.execute(
-                "SELECT close, volume, funding_rate, depth FROM ws_data WHERE symbol=? ORDER BY timestamp DESC LIMIT ?",
-                (symbol, GlobalConfig.get('data_retention_limit'))
-            )
-            data = cursor.fetchall()
+        cursor = self.db_conn.cursor()
+        cursor.execute(
+            "SELECT close, volume, funding_rate, depth FROM ws_data WHERE symbol=? ORDER BY timestamp DESC LIMIT ?",
+            (symbol, GlobalConfig.get('data_retention_limit', 100))
+        )
+        data = cursor.fetchall()
         if data:
             logging.info(f"ดึงข้อมูลสำรองสำหรับ {symbol}: {len(data)} แถว")
             return data[::-1]
@@ -258,26 +304,26 @@ class WebSocketManager:
                 self.data[symbol] = {
                     'close': last_data[0],
                     'volume': last_data[1],
-                    'timestamp': datetime.utcnow().timestamp(),
+                    'timestamp': time.time(),
                     'funding_rate': last_data[2],
                     'depth': last_data[3]
                 }
             else:
                 try:
-                    ticker = await self.exchange.fetch_ticker(symbol, params={'timestamp': await self.exchange.get_adjusted_timestamp(), 'recvWindow': 5000})
+                    ticker = await self.exchange.fetch_ticker(symbol)
                     self.data[symbol] = {
                         'close': ticker['last'],
-                        'volume': ticker['quoteVolume'],
-                        'timestamp': datetime.utcnow().timestamp(),
+                        'volume': ticker.get('quoteVolume', 0),
+                        'timestamp': time.time(),
                         'funding_rate': 0.0001,
-                        'depth': 0
+                        'depth': (ticker.get('ask', 0) - ticker.get('bid', 0))
                     }
                 except Exception as e:
                     logging.error(f"ดึง ticker สำรองสำหรับ {symbol} ล้มเหลว: {e}")
                     self.data[symbol] = {
                         'close': 10000,
                         'volume': 100,
-                        'timestamp': datetime.utcnow().timestamp(),
+                        'timestamp': time.time(),
                         'funding_rate': 0.0001,
                         'depth': 0
                     }
@@ -286,7 +332,7 @@ class WebSocketManager:
     def get_latest_price(self, symbol):
         """ดึงราคาล่าสุดของเหรียญ"""
         default_price = 10000
-        return self.cache.get(symbol.upper(), self.data.get(symbol.upper(), {})).get('close', default_price)
+        return self.cache.get(symbol, self.data.get(symbol, {})).get('close', default_price)
 
     def get_latest_balance(self):
         """ดึงยอดเงินล่าสุด"""
@@ -297,8 +343,7 @@ class WebSocketManager:
         for symbol in symbols:
             for tf in timeframes:
                 try:
-                    klines = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=100,
-                                                            params={'timestamp': await self.exchange.get_adjusted_timestamp(), 'recvWindow': 5000})
+                    klines = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=100)
                     for kline in klines:
                         timestamp, open_p, high, low, close, volume = kline
                         self.multi_tf_data[tf].append((timestamp / 1000, open_p, high, low, close, volume))
