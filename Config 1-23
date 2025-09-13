@@ -4,6 +4,10 @@
 # สามารถดึงค่าหรือแก้ไขค่าได้แบบเรียลไทม์
 # ===============================================
 
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
 class GlobalConfig:
     CONFIG = {
         # ===============================
@@ -112,6 +116,12 @@ class GlobalConfig:
         'system_running': False,                           # สถานะการรันระบบ (True = ทำงาน, False = หยุด)
         'trade_log_file': 'trade_log.xlsx',                # ไฟล์บันทึกการเทรด (สำหรับบันทึก transaction history)
         'log_level': 'INFO',                               # ระดับการบันทึก log ('DEBUG', 'INFO', 'WARNING', 'ERROR') สำหรับระบบโดยรวม
+
+        # ===============================
+        # Additional Parameters for MADRL
+        # พารามิเตอร์เพิ่มเติมสำหรับ MADRL
+        # ===============================
+        'max_leverage_per_symbol': {'BTCUSDT': 125, 'ETHUSDT': 125},  # Leverage สูงสุดต่อ symbol (default 125)
     }
 
     @classmethod
@@ -132,3 +142,5 @@ class GlobalConfig:
         """
         cls.CONFIG[key] = value
         logging.info(f"อัพเดทค่า CONFIG: {key} เป็น {value}")
+
+CONFIG = GlobalConfig.CONFIG
