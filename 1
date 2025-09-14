@@ -15,7 +15,7 @@ from collections import deque
 from typing import Optional, Dict, Any
 import ccxt.async_support as ccxt_async
 from tenacity import retry, wait_exponential, stop_after_attempt
-from config import GlobalConfig
+#from config import GlobalConfig
 
 # การตั้งค่าระบบบันทึก log เฉพาะสำหรับคลาสนี้
 log_level_str = GlobalConfig.get('log_level', 'INFO').upper()
