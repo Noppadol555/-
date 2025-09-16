@@ -1,4 +1,5 @@
-# นำเข้าโมดูลที่จำเป็น
+# auto_installer_fixed.py
+# ปรับปรุงจากต้นฉบับ: แก้บั๊กสำคัญ, ปรับ error handling, ทำให้โค้ดเสถียรขึ้น
 import os
 import sys
 import subprocess
@@ -18,19 +19,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from urllib.request import urlopen
 from urllib.error import HTTPError, URLError
-from packaging import version as pkg_version
+from packaging import version as pkg_version  # already imported safely at top
 from packaging.requirements import Requirement
 import time
 import psutil
 from pathlib import Path
 
-# นำเข้าโมดูลเสริม (ถ้ามี)
+# optional tqdm
 try:
     from tqdm import tqdm
-except ImportError:
+except Exception:
     tqdm = None
 
-# ==================== การตั้งค่าเริ่มต้น ====================
+# ==================== Logging ====================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -41,26 +42,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== ฟังก์ชันตรวจสอบสิทธิ์ admin ====================
+# ==================== Helpers ====================
 def is_admin() -> bool:
     try:
         if platform.system() == "Windows":
             return ctypes.windll.shell32.IsUserAnAdmin() != 0
         else:
             return os.geteuid() == 0
-    except AttributeError:
+    except Exception:
         return False
 
-# ==================== ฟังก์ชันตรวจสอบทรัพยากรระบบ ====================
-def check_system_resources() -> bool:
-    """ตรวจสอบ disk space และ RAM"""
+def check_system_resources(min_disk_bytes: int = 2 * 1024 * 1024 * 1024, min_mem_bytes: int = 1 * 1024 * 1024 * 1024) -> bool:
     try:
         disk = shutil.disk_usage(os.path.abspath("."))
-        if disk.free < 2 * 1024 * 1024 * 1024:  # น้อยกว่า 2GB
+        if disk.free < min_disk_bytes:
             logger.error("พื้นที่ดิสก์เหลือน้อยเกินไป (<2GB)")
             return False
         mem = psutil.virtual_memory()
-        if mem.available < 1 * 1024 * 1024 * 1024:  # น้อยกว่า 1GB
+        if mem.available < min_mem_bytes:
             logger.error("หน่วยความจำเหลือน้อยเกินไป (<1GB)")
             return False
         return True
@@ -68,81 +67,111 @@ def check_system_resources() -> bool:
         logger.warning(f"ไม่สามารถตรวจสอบทรัพยากรระบบ: {e}")
         return True
 
-# ==================== ฟังก์ชันตรวจสอบ Python Version ====================
 def check_python_version(min_version: str = "3.8") -> bool:
-    """ตรวจสอบว่า Python version เข้ากันได้"""
     current_version = f"{sys.version_info.major}.{sys.version_info.minor}"
     if pkg_version.parse(current_version) < pkg_version.parse(min_version):
         logger.error(f"ต้องการ Python >= {min_version}, พบ {current_version}")
         return False
     return True
 
-# ==================== ฟังก์ชันตรวจสอบ Compiler ====================
+def safe_run(cmd: List[str], timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+    """เรียก subprocess โดยไม่ใช้ shell=True"""
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+
+# ==================== Compiler ====================
 def check_and_install_compiler() -> bool:
-    """ตรวจสอบและติดตั้งเครื่องมือ build ถ้าจำเป็น"""
     system = platform.system()
-    if system == "Linux":
-        try:
-            result = subprocess.run(["gcc", "--version"], capture_output=True, text=True)
-            if result.returncode == 0:
-                logger.info("พบ gcc สำหรับการ build source distribution")
+    try:
+        if system == "Linux":
+            # check gcc
+            try:
+                res = safe_run(["gcc", "--version"])
+                if res.returncode == 0:
+                    logger.info("พบ gcc สำหรับการ build source distribution")
+                    return True
+            except Exception:
+                pass
+            # try apt-get (best-effort; may fail on non-debian)
+            try:
+                logger.info("พยายามติดตั้ง build-essential และ cmake (ต้องใช้สิทธิ์ sudo)")
+                cmd = ["sudo", "apt-get", "install", "-y", "build-essential", "cmake"]
+                subprocess.run(cmd, check=True)
                 return True
-            logger.info("กำลังติดตั้ง build-essential และ cmake")
-            cmd = ["sudo", "apt-get", "install", "-y", "build-essential", "cmake"]
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-            return True
-        except subprocess.CalledProcessError as e:
-            logger.error(f"ไม่สามารถติดตั้ง build-essential และ cmake: {e}")
-            return False
-    elif system == "Darwin":
-        try:
-            result = subprocess.run(["clang", "--version"], capture_output=True, text=True)
-            if result.returncode == 0:
-                logger.info("พบ clang สำหรับการ build source distribution")
+            except Exception as e:
+                logger.error(f"ไม่สามารถติดตั้ง build-essential และ cmake: {e}")
+                return False
+        elif system == "Darwin":
+            try:
+                res = safe_run(["clang", "--version"])
+                if res.returncode == 0:
+                    logger.info("พบ clang สำหรับการ build source distribution")
+                    return True
+            except Exception:
+                pass
+            try:
+                logger.info("พยายามติดตั้ง Xcode Command Line Tools")
+                subprocess.run(["xcode-select", "--install"], check=True)
                 return True
-            logger.info("กำลังติดตั้ง Xcode Command Line Tools")
-            cmd = ["xcode-select", "--install"]
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-            return True
-        except subprocess.CalledProcessError as e:
-            logger.error(f"ไม่สามารถติดตั้ง Xcode Command Line Tools: {e}")
-            return False
-    elif system == "Windows":
-        try:
-            result = subprocess.run(["cl"], capture_output=True, text=True)
-            if result.returncode == 0:
-                logger.info("พบ MSVC สำหรับการ build source distribution")
-                return True
+            except Exception as e:
+                logger.error(f"ไม่สามารถติดตั้ง Xcode Command Line Tools: {e}")
+                return False
+        elif system == "Windows":
+            try:
+                res = safe_run(["cl"])
+                if res.returncode == 0:
+                    logger.info("พบ MSVC สำหรับการ build source distribution")
+                    return True
+            except Exception:
+                pass
             logger.warning("กรุณาติดตั้ง Visual Studio Build Tools สำหรับ source builds")
             return False
-        except Exception:
-            logger.warning("ไม่พบ MSVC อาจต้องติดตั้ง Visual Studio Build Tools")
-            return False
-    return True
+    except Exception as e:
+        logger.debug(f"check_and_install_compiler exception: {e}")
+    return False
 
-# ==================== ฟังก์ชันอัพเดท pip ====================
+# ==================== pip self-update ====================
 def self_update() -> bool:
+    # update pip, using --user when not admin
+    tmp_out = tmp_err = None
     try:
         logger.info("กำลังอัพเดท pip เป็นเวอร์ชันล่าสุด")
         cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "pip"]
         if not is_admin():
             cmd.append("--user")
-        with tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8') as tmp_out, \
-             tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8') as tmp_err:
-            result = subprocess.run(cmd, stdout=tmp_out, stderr=tmp_err, text=True, check=True)
+        with tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8') as tmp_out:
+            with tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8') as tmp_err:
+                try:
+                    subprocess.run(cmd, stdout=tmp_out, stderr=tmp_err, check=True, text=True)
+                finally:
+                    pass
         logger.info("อัพเดท pip สำเร็จ")
-        os.unlink(tmp_out.name)
-        os.unlink(tmp_err.name)
+        try:
+            os.unlink(tmp_out.name)
+            os.unlink(tmp_err.name)
+        except Exception:
+            pass
         return True
-    except subprocess.CalledProcessError as e:
-        with open(tmp_err.name, 'r', encoding='utf-8') as f:
-            error_output = f.read()
-        logger.warning(f"ไม่สามารถอัพเดท pip: {error_output}")
-        os.unlink(tmp_out.name)
-        os.unlink(tmp_err.name)
+    except subprocess.CalledProcessError:
+        # try to read error if files exist
+        try:
+            if tmp_err and os.path.exists(tmp_err.name):
+                with open(tmp_err.name, 'r', encoding='utf-8') as f:
+                    logger.warning(f"ไม่สามารถอัพเดท pip: {f.read()}")
+        except Exception:
+            pass
+        try:
+            if tmp_out and os.path.exists(tmp_out.name):
+                os.unlink(tmp_out.name)
+            if tmp_err and os.path.exists(tmp_err.name):
+                os.unlink(tmp_err.name)
+        except Exception:
+            pass
+        return False
+    except Exception as e:
+        logger.warning(f"ไม่สามารถอัพเดท pip: {e}")
         return False
 
-# ==================== ฟังก์ชันจัดการการตั้งค่า ====================
+# ==================== Config ====================
 def load_config(config_path: str = "install_config.json") -> Dict:
     config = {
         "max_workers": 4,
@@ -150,9 +179,9 @@ def load_config(config_path: str = "install_config.json") -> Dict:
         "dry_run": False,
         "cache_ttl": 3600,
         "network_timeout": 10,
-        "retry_attempts": 5,  # เพิ่ม retry เป็น 5
-        "max_retries_network": 5,  # Retry สำหรับเครือข่าย
-        "backoff_factor": 2  # Backoff สำหรับเครือข่าย
+        "retry_attempts": 5,
+        "max_retries_network": 5,
+        "backoff_factor": 2
     }
     if os.path.exists(config_path):
         try:
@@ -163,19 +192,14 @@ def load_config(config_path: str = "install_config.json") -> Dict:
             logger.warning(f"ไม่สามารถโหลด {config_path}: {e}")
     return config
 
-# ==================== ฟังก์ชันจัดการ PyPI Cache ====================
+# ==================== PyPI cache ====================
 def load_pypi_cache(cache_file: str = "pypi_cache.json") -> Dict[str, Dict]:
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
                 cache = json.load(f)
-                # ตรวจสอบ TTL
-                current_time = time.time()
-                valid_cache = {}
-                for pkg, data in cache.items():
-                    if data.get("timestamp", 0) + 3600 > current_time:
-                        valid_cache[pkg] = data
-                return valid_cache
+                # validate TTL later by caller
+                return cache
         except Exception as e:
             logger.warning(f"ไม่สามารถโหลดแคช PyPI: {e}")
     return {}
@@ -188,75 +212,81 @@ def save_pypi_cache(cache: Dict[str, Dict], cache_file: str = "pypi_cache.json")
     except Exception as e:
         logger.warning(f"ไม่สามารถบันทึกแคช PyPI: {e}")
 
-# ==================== ฟังก์ชันดึงข้อมูลจาก PyPI ====================
-@lru_cache(maxsize=128)
-def get_pypi_info(pkg: str, timeout: int = 10, retry: int = 5, backoff_factor: float = 2) -> Optional[Dict]:
-    pypi_cache = load_pypi_cache()
-    if pkg in pypi_cache:
-        logger.debug(f"ใช้ข้อมูลจากแคชสำหรับ {pkg}")
-        return pypi_cache[pkg]
+# ==================== PyPI info ====================
+@lru_cache(maxsize=256)
+def get_pypi_info(pkg: str, timeout: int = 10, retry: int = 5, backoff_factor: float = 2, cache_ttl: int = 3600) -> Optional[Dict]:
+    pkg_norm = pkg.lower().replace("_", "-")
+    cache = load_pypi_cache()
+    entry = cache.get(pkg_norm)
+    current_time = time.time()
+    if entry and entry.get("timestamp", 0) + cache_ttl > current_time:
+        return entry
 
+    url = f"https://pypi.org/pypi/{pkg_norm}/json"
     for attempt in range(1, retry + 1):
         try:
-            url = f"https://pypi.org/pypi/{pkg}/json"
             with urlopen(url, timeout=timeout) as response:
                 if response.getcode() != 200:
                     raise HTTPError(url, response.getcode(), "HTTP Error", None, None)
                 data = json.loads(response.read().decode('utf-8'))
-                pypi_cache[pkg] = {
+                out = {
                     "version": data["info"]["version"],
                     "requires_dist": data["info"].get("requires_dist", []),
-                    "releases": data["releases"],
+                    "releases": data.get("releases", {}),
                     "timestamp": time.time()
                 }
-                save_pypi_cache(pypi_cache)
-                return pypi_cache[pkg]
+                cache[pkg_norm] = out
+                save_pypi_cache(cache)
+                return out
         except (HTTPError, URLError, json.JSONDecodeError, Exception) as e:
-            logger.warning(f"พยายามครั้งที่ {attempt} ล้มเหลวในการดึงข้อมูลของ {pkg}: {e}")
+            logger.debug(f"พยายามครั้งที่ {attempt} ล้มเหลวในการดึงข้อมูลของ {pkg}: {e}")
             if attempt < retry:
                 time.sleep(backoff_factor * (2 ** (attempt - 1)))
     logger.warning(f"ไม่สามารถดึงข้อมูลของ {pkg} หลังจากลอง {retry} ครั้ง")
     return None
 
-# ==================== ฟังก์ชันตรวจสอบ Wheel Compatibility ====================
-def check_wheel_availability(pkg: str, version: str, python_version: str, platform_tags: List[str], timeout: int = 10, retry: int = 5) -> bool:
-    pypi_cache = load_pypi_cache()
-    cache_key = f"{pkg}:{version}"
-    if cache_key in pypi_cache and "wheels" in pypi_cache[cache_key]:
-        return pypi_cache[cache_key]["wheels"]
-
+# ==================== Wheel availability ====================
+def check_wheel_availability(pkg: str, version: str, platform_tags: List[str], timeout: int = 10, retry: int = 3) -> bool:
+    pkg_norm = pkg.lower().replace("_", "-")
+    cache = load_pypi_cache()
+    cache_key = f"{pkg_norm}:{version}"
+    if cache.get(cache_key) and "wheels" in cache[cache_key]:
+        return cache[cache_key]["wheels"]
+    url = f"https://pypi.org/pypi/{pkg_norm}/{version}/json"
     for attempt in range(1, retry + 1):
         try:
-            url = f"https://pypi.org/pypi/{pkg}/{version}/json"
             with urlopen(url, timeout=timeout) as response:
                 if response.getcode() != 200:
                     raise HTTPError(url, response.getcode(), "HTTP Error", None, None)
                 data = json.loads(response.read().decode('utf-8'))
-                for release in data["releases"].get(version, []):
-                    if release["packagetype"] == "bdist_wheel":
+                has_wheel = False
+                for release in data.get("releases", {}).get(version, []):
+                    if release.get("packagetype") == "bdist_wheel":
+                        fname = release.get("filename", "")
                         for tag in platform_tags:
-                            if tag in release["filename"]:
-                                pypi_cache[cache_key] = {"wheels": True}
-                                save_pypi_cache(pypi_cache)
-                                return True
-                pypi_cache[cache_key] = {"wheels": False}
-                save_pypi_cache(pypi_cache)
-                return False
-        except (HTTPError, URLError, json.JSONDecodeError, Exception) as e:
-            logger.warning(f"พยายามครั้งที่ {attempt} ล้มเหลวในการตรวจสอบ wheel สำหรับ {pkg}=={version}: {e}")
+                            if tag and tag in fname:
+                                has_wheel = True
+                                break
+                        if has_wheel:
+                            break
+                cache[cache_key] = {"wheels": has_wheel, "timestamp": time.time()}
+                save_pypi_cache(cache)
+                return has_wheel
+        except Exception as e:
+            logger.debug(f"ตรวจ wheel ล้มเหลว (attempt {attempt}) สำหรับ {pkg}=={version}: {e}")
             if attempt < retry:
-                time.sleep(2 * (2 ** (attempt - 1)))
+                time.sleep(2 ** attempt)
     logger.warning(f"ไม่สามารถตรวจสอบ wheel สำหรับ {pkg}=={version}")
     return False
 
-# ==================== ฟังก์ชันตรวจสอบและแก้ไขความขัดแย้ง ====================
+# ==================== Resolve conflicts ====================
 def resolve_conflicts(requirements: Dict[str, str], installed_libs: Dict[str, str]) -> Dict[str, str]:
     resolved = requirements.copy()
-    for pkg in requirements:
-        pypi_info = get_pypi_info(pkg)
-        if not pypi_info:
+    for pkg, ver in list(requirements.items()):
+        pinfo = get_pypi_info(pkg)
+        if not pinfo:
             continue
-        for dep in pypi_info.get("requires_dist", []):
+        for dep in pinfo.get("requires_dist", []):
             try:
                 req = Requirement(dep)
                 dep_name = req.name.replace("-", "_").lower()
@@ -264,112 +294,79 @@ def resolve_conflicts(requirements: Dict[str, str], installed_libs: Dict[str, st
                     dep_version = resolved[dep_name]
                     if not req.specifier.contains(dep_version):
                         logger.warning(f"ความขัดแย้ง: {pkg} ต้องการ {dep}, แต่มี {dep_name}=={dep_version}")
-                        # ลองเวอร์ชันล่าสุด
-                        latest_version = get_pypi_info(dep_name).get("version") if get_pypi_info(dep_name) else None
-                        if latest_version and req.specifier.contains(latest_version):
-                            resolved[dep_name] = latest_version
-                            logger.info(f"แก้ไขโดยใช้ {dep_name}=={latest_version}")
-                        else:
-                            # ลองเวอร์ชันเก่ากว่า
-                            releases = get_pypi_info(dep_name).get("releases", {})
-                            for ver in sorted(releases.keys(), key=lambda x: pkg_version.parse(x), reverse=True):
-                                if req.specifier.contains(ver):
-                                    resolved[dep_name] = ver
-                                    logger.info(f"แก้ไขโดยใช้ {dep_name}=={ver}")
+                        # try latest that matches specifier
+                        dep_info = get_pypi_info(dep_name)
+                        if dep_info:
+                            for candidate in sorted(dep_info.get("releases", {}).keys(), key=lambda x: pkg_version.parse(x), reverse=True):
+                                if req.specifier.contains(candidate):
+                                    resolved[dep_name] = candidate
+                                    logger.info(f"แก้ไขโดยใช้ {dep_name}=={candidate}")
                                     break
                             else:
                                 logger.warning(f"ไม่สามารถแก้ไขความขัดแย้งสำหรับ {dep_name}")
-            except Exception as e:
-                logger.debug(f"ข้าม dependency {dep}: {e}")
+            except Exception:
+                continue
     return resolved
 
-# ==================== ฟังก์ชันเลือกเวอร์ชันที่เหมาะสม ====================
-def select_compatible_version(pkg: str, device_type: str, cuda_version: Optional[str], python_version: str, platform_tags: List[str], installed_libs: Dict[str, str]) -> Optional[str]:
-    pypi_info = get_pypi_info(pkg)
-    if not pypi_info:
-        logger.warning(f"ไม่สามารถหาเวอร์ชันล่าสุดสำหรับ {pkg}")
+# ==================== Select compatible version ====================
+def select_compatible_version(pkg: str, device_type: str, cuda_version: Optional[str], python_tag: str, platform_tags: List[str], installed_libs: Dict[str, str]) -> Optional[str]:
+    info = get_pypi_info(pkg)
+    if not info:
         return None
-    latest_version = pypi_info["version"]
+    latest = info.get("version")
+    # default: prefer latest but check wheel
+    if check_wheel_availability(pkg, latest, platform_tags):
+        return latest
+    # fallback: find newest release that has wheel
+    releases = info.get("releases", {})
+    for ver in sorted(releases.keys(), key=lambda x: pkg_version.parse(x), reverse=True):
+        if check_wheel_availability(pkg, ver, platform_tags):
+            return ver
+    # as last resort return latest (may require source build)
+    return latest
 
-    if not check_wheel_availability(pkg, latest_version, python_version, platform_tags):
-        logger.warning(f"ไม่มี wheel สำหรับ {pkg}=={latest_version} บนแพลตฟอร์มนี้")
-        if not check_and_install_compiler():
-            logger.error(f"ไม่สามารถ build {pkg} จาก source เนื่องจากไม่มี compiler")
-            return None
-        # ลองเวอร์ชันเก่ากว่าที่มี wheel
-        releases = pypi_info.get("releases", {})
-        for ver in sorted(releases.keys(), key=lambda x: pkg_version.parse(x), reverse=True):
-            if check_wheel_availability(pkg, ver, python_version, platform_tags):
-                logger.info(f"เลือก {pkg}=={ver} ที่มี wheel")
-                return ver
-
-    if pkg == "torch":
-        if device_type == "cuda" and cuda_version:
-            return latest_version
-        elif device_type == "mps" and pkg_version and pkg_version.parse(latest_version) >= pkg_version.parse("1.12.0"):
-            return latest_version
-        else:
-            return latest_version
-    elif pkg == "torch_geometric":
-        torch_version = installed_libs.get("torch", get_pypi_info("torch").get("version"))
-        return latest_version
-    elif pkg in ["torch_scatter", "torch_sparse", "torch_cluster", "torch_spline_conv"]:
-        return latest_version
-    elif pkg == "darts":
-        if pkg_version and pkg_version.parse(latest_version) > pkg_version.parse("0.30.0"):
-            return "0.30.0"  # ค่าเริ่มต้นที่รู้ว่าสเถียร
-        return latest_version
-    elif pkg == "keyboard":
-        if platform.system() == "Linux" and not is_admin():
-            logger.warning("keyboard อาจต้องติดตั้งด้วย --user หรือ sudo")
-        return latest_version
-    else:
-        return latest_version
-
-# ==================== ฟังก์ชันดึง Dependencies อัตโนมัติ ====================
+# ==================== Get dependencies recursively ====================
 def get_dependencies(pkg: str, visited: Set[str] = None) -> Dict[str, str]:
     if visited is None:
         visited = set()
-    if pkg in visited:
+    name = pkg.lower().replace("_", "-")
+    if name in visited:
         return {}
-    visited.add(pkg)
-
-    dependencies = {}
-    pypi_info = get_pypi_info(pkg)
-    if not pypi_info:
-        return dependencies
-
-    for dep in pypi_info.get("requires_dist", []):
+    visited.add(name)
+    deps: Dict[str, str] = {}
+    pinfo = get_pypi_info(name)
+    if not pinfo:
+        return deps
+    for dep in pinfo.get("requires_dist", []):
         try:
             req = Requirement(dep)
             dep_name = req.name.replace("-", "_").lower()
             if dep_name in {"python", "setuptools", "wheel"}:
                 continue
-            dep_version = get_pypi_info(dep_name).get("version") if get_pypi_info(dep_name) else None
-            if dep_version and req.specifier.contains(dep_version):
-                dependencies[dep_name] = dep_version
-                sub_deps = get_dependencies(dep_name, visited)
-                dependencies.update(sub_deps)
-        except Exception as e:
-            logger.debug(f"ข้าม dependency {dep}: {e}")
-    return dependencies
+            dep_info = get_pypi_info(dep_name)
+            if dep_info:
+                dep_ver = dep_info.get("version")
+                if dep_ver and (not req.specifier or req.specifier.contains(dep_ver)):
+                    deps[dep_name] = dep_ver
+                    sub = get_dependencies(dep_name, visited)
+                    deps.update(sub)
+        except Exception:
+            continue
+    return deps
 
-# ==================== ฟังก์ชันสร้าง requirements.txt ====================
-def generate_requirements(project_libs: Set[str], device_type: str, cuda_version: Optional[str], python_version: str, platform_tags: List[str], installed_libs: Dict[str, str], requirements_file: str = "requirements.txt") -> bool:
+# ==================== Generate requirements.txt ====================
+def generate_requirements(project_libs: Set[str], device_type: str, cuda_version: Optional[str], python_tag: str, platform_tags: List[str], installed_libs: Dict[str, str], requirements_file: str = "requirements.txt") -> bool:
     try:
-        requirements = {}
+        requirements: Dict[str, str] = {}
         for lib in sorted(project_libs):
-            version = select_compatible_version(lib, device_type, cuda_version, python_version, platform_tags, installed_libs)
-            if version:
-                requirements[lib] = version
+            ver = select_compatible_version(lib, device_type, cuda_version, python_tag, platform_tags, installed_libs)
+            if ver:
+                requirements[lib] = ver
                 deps = get_dependencies(lib)
                 requirements.update(deps)
             else:
-                logger.warning(f"ข้าม {lib} เนื่องจากไม่พบเวอร์ชัน")
-                continue
-
+                logger.warning(f"ข้าม {lib} เนื่องจากไม่พบเวอร์ชันที่เหมาะสม")
         requirements = resolve_conflicts(requirements, installed_libs)
-
         with open(requirements_file, "w", encoding="utf-8") as f:
             f.write("# requirements.txt สร้างโดยอัตโนมัติ\n")
             for pkg, ver in sorted(requirements.items()):
@@ -380,20 +377,21 @@ def generate_requirements(project_libs: Set[str], device_type: str, cuda_version
         logger.error(f"ไม่สามารถสร้าง {requirements_file}: {e}")
         return False
 
-# ==================== ฟังก์ชันติดตั้งแพ็กเกจ ====================
+# ==================== pip install helper ====================
 def install_package(pkg: str, version: Optional[str] = None, dry_run: bool = False, retry: int = 5, index_url: Optional[str] = None) -> bool:
+    # try import to check presence
     try:
         spec = importlib.util.find_spec(pkg)
         if spec:
             module = importlib.import_module(pkg)
-            installed_version = getattr(module, '__version__', 'unknown')
+            installed_version = getattr(module, '__version__', None)
             if version and installed_version == version:
                 logger.info(f"{pkg} เวอร์ชัน {installed_version} ติดตั้งแล้ว")
                 return True
             elif not version:
                 logger.info(f"{pkg} (เวอร์ชัน {installed_version}) ติดตั้งแล้ว")
                 return True
-    except ImportError:
+    except Exception:
         pass
 
     if dry_run:
@@ -401,36 +399,59 @@ def install_package(pkg: str, version: Optional[str] = None, dry_run: bool = Fal
         return True
 
     pkg_spec = f"{pkg}=={version}" if version else pkg
-    scopes = ["--user", ""] if pkg == "keyboard" or not is_admin() else [""]
+    scopes = ["--user", ""] if not is_admin() else [""]
     for scope in scopes:
         for attempt in range(1, retry + 1):
-            logger.info(f"ติดตั้ง {pkg_spec} {'ใน user scope' if scope else ''} (พยายามครั้งที่ {attempt}/{retry})")
+            tmp_out = tmp_err = None
             try:
-                with tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8') as tmp_out, \
-                     tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8') as tmp_err:
-                    cmd = [sys.executable, "-m", "pip", "install"]
-                    if scope:
-                        cmd.append(scope)
-                    if index_url:
-                        cmd.extend(["--index-url", index_url])
-                    cmd.append(pkg_spec)
-                    result = subprocess.run(cmd, stdout=tmp_out, stderr=tmp_err, text=True, check=True)
-                    logger.info(f"ติดตั้ง {pkg_spec} {'ใน user scope' if scope else ''} สำเร็จ")
+                logger.info(f"ติดตั้ง {pkg_spec} {'ใน user scope' if scope else ''} (พยายามครั้งที่ {attempt}/{retry})")
+                with tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8') as tmp_out:
+                    with tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8') as tmp_err:
+                        cmd = [sys.executable, "-m", "pip", "install"]
+                        if scope:
+                            cmd.append(scope)
+                        if index_url:
+                            cmd.extend(["--index-url", index_url])
+                        cmd.append(pkg_spec)
+                        subprocess.run(cmd, stdout=tmp_out, stderr=tmp_err, check=True, text=True)
+                logger.info(f"ติดตั้ง {pkg_spec} {'ใน user scope' if scope else ''} สำเร็จ")
+                # cleanup
+                try:
                     os.unlink(tmp_out.name)
                     os.unlink(tmp_err.name)
-                    return True
-            except subprocess.CalledProcessError as e:
-                with open(tmp_err.name, 'r', encoding='utf-8') as f:
-                    error_output = f.read()
-                logger.warning(f"พยายามครั้งที่ {attempt} ล้มเหลวในการติดตั้ง {pkg_spec} {'ใน user scope' if scope else ''}: {error_output}")
-                os.unlink(tmp_out.name)
-                os.unlink(tmp_err.name)
+                except Exception:
+                    pass
+                return True
+            except subprocess.CalledProcessError:
+                # read error
+                try:
+                    if tmp_err and os.path.exists(tmp_err.name):
+                        with open(tmp_err.name, 'r', encoding='utf-8') as f:
+                            error_output = f.read()
+                        logger.warning(f"พยายามครั้งที่ {attempt} ล้มเหลวในการติดตั้ง {pkg_spec}: {error_output}")
+                except Exception:
+                    pass
+                try:
+                    if tmp_out and os.path.exists(tmp_out.name):
+                        os.unlink(tmp_out.name)
+                    if tmp_err and os.path.exists(tmp_err.name):
+                        os.unlink(tmp_err.name)
+                except Exception:
+                    pass
                 if attempt < retry:
-                    time.sleep(2 * (2 ** (attempt - 1)))
-    logger.error(f"ไม่สามารถติดตั้ง {pkg_spec} หลังจากลอง {retry} ครั้งในทุก scope")
+                    time.sleep(2 ** attempt)
+            except Exception as e:
+                logger.warning(f"ติดตั้ง {pkg_spec} ล้มเหลวด้วย exception: {e}")
+                if tmp_out and os.path.exists(tmp_out.name):
+                    try:
+                        os.unlink(tmp_out.name)
+                        os.unlink(tmp_err.name)
+                    except Exception:
+                        pass
+                break
+    logger.error(f"ไม่สามารถติดตั้ง {pkg_spec} หลังจากลอง {retry} ครั้ง")
     return False
 
-# ==================== ฟังก์ชันตรวจสอบและติดตั้งไลบรารี ====================
 def ensure_library(lib: str, version: Optional[str] = None, dry_run: bool = False, retry: int = 5, index_url: Optional[str] = None) -> bool:
     try:
         importlib.import_module(lib)
@@ -439,7 +460,7 @@ def ensure_library(lib: str, version: Optional[str] = None, dry_run: bool = Fals
     except ImportError:
         return install_package(lib, version, dry_run, retry, index_url)
 
-# ==================== ฟังก์ชันสแกน imports จากไฟล์ Python ====================
+# ==================== Extract imports ====================
 def extract_imports(file_path: str) -> Set[str]:
     libraries: Set[str] = set()
     try:
@@ -454,43 +475,50 @@ def extract_imports(file_path: str) -> Set[str]:
                     if node.module:
                         lib_name = node.module.split('.')[0]
                         libraries.add(lib_name)
-        logger.debug(f"วิเคราะห์ {file_path}: พบ {len(libraries)} ไลบรารี")
         return libraries
     except Exception as e:
-        logger.error(f"ไม่สามารถวิเคราะห์ {file_path}: {e}")
+        logger.debug(f"ไม่สามารถวิเคราะห์ {file_path}: {e}")
         return set()
 
-# ==================== ฟังก์ชันสแกนโปรเจ็กต์ ====================
 def scan_project_for_libraries(project_dir: str, ignore_patterns: List[str]) -> Set[str]:
     all_libraries: Set[str] = set()
     project_path = Path(project_dir)
     ignore_regex = [re.compile(pattern) for pattern in ignore_patterns]
-
+    current_script = Path(sys.argv[0]).resolve()
     for file_path in project_path.rglob("*.py"):
-        if str(file_path) == str(Path(sys.argv[0]).resolve()):
-            continue
+        try:
+            if file_path.resolve() == current_script:
+                continue
+        except Exception:
+            pass
         if any(any(regex.search(str(part)) for regex in ignore_regex) for part in file_path.parts):
             continue
-        libraries = extract_imports(str(file_path))
-        all_libraries.update(libraries)
-
+        libs = extract_imports(str(file_path))
+        all_libraries.update(libs)
     logger.info(f"พบ {len(all_libraries)} ไลบรารีในโปรเจ็กต์")
     return all_libraries
 
-# ==================== ฟังก์ชันตรวจจับฮาร์ดแวร์ ====================
+# ==================== Detect hardware ====================
 def detect_hardware() -> Tuple[str, Optional[str]]:
     try:
-        output = subprocess.check_output("nvidia-smi", shell=True, text=True)
-        match = re.search(r"CUDA Version:\s*(\d+\.\d+)", output)
-        if match:
-            cuda_version = match.group(1)
-            short_version = "".join(cuda_version.split("."))
-            logger.info(f"ตรวจพบ CUDA เวอร์ชัน: {cuda_version}")
-            return "cuda", f"cu{short_version}"
+        res = safe_run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"], timeout=5)
+        if res.returncode == 0 and res.stdout.strip():
+            # get CUDA version by running nvidia-smi and parse possible "CUDA Version" line
+            try:
+                out = subprocess.check_output(["nvidia-smi"], text=True)
+                m = re.search(r"CUDA Version:\s*([\d\.]+)", out)
+                if m:
+                    cuda_version = m.group(1)
+                    short = "cu" + "".join(cuda_version.split("."))
+                    logger.info(f"ตรวจพบ CUDA เวอร์ชัน: {cuda_version}")
+                    return "cuda", short
+            except Exception:
+                return "cuda", None
     except Exception:
         pass
+    # check mac mps
     try:
-        if platform.system() == "Darwin" and subprocess.run("sysctl -n machdep.cpu.brand_string", shell=True, capture_output=True, text=True).returncode == 0:
+        if platform.system() == "Darwin" and platform.machine().startswith("arm"):
             logger.info("ตรวจพบ Apple Silicon (MPS)")
             return "mps", None
     except Exception:
@@ -498,14 +526,13 @@ def detect_hardware() -> Tuple[str, Optional[str]]:
     logger.info("ไม่พบ CUDA หรือ MPS ใช้ CPU")
     return "cpu", None
 
-# ==================== ฟังก์ชันตรวจสอบความเข้ากันได้ ====================
+# ==================== Compatibility check ====================
 def check_compatibility(lib: str, version: str, installed_libs: Dict[str, str]) -> bool:
-    pypi_info = get_pypi_info(lib)
-    if not pypi_info:
-        logger.warning(f"ไม่สามารถตรวจสอบความเข้ากันได้สำหรับ {lib}")
+    info = get_pypi_info(lib)
+    if not info:
+        logger.debug(f"ไม่พบ pypi info สำหรับ {lib} — ข้ามการตรวจ")
         return True
-
-    for dep in pypi_info.get("requires_dist", []):
+    for dep in info.get("requires_dist", []):
         try:
             req = Requirement(dep)
             dep_name = req.name.replace("-", "_").lower()
@@ -514,12 +541,12 @@ def check_compatibility(lib: str, version: str, installed_libs: Dict[str, str]) 
                 if not req.specifier.contains(installed_version):
                     logger.warning(f"ความขัดแย้ง: {lib}=={version} ต้องการ {dep}, แต่ติดตั้ง {dep_name}=={installed_version}")
                     return False
-        except Exception as e:
-            logger.debug(f"ข้ามการตรวจสอบ dependency {dep}: {e}")
+        except Exception:
+            continue
     return True
 
-# ==================== ฟังก์ชันติดตั้ง PyTorch และ Torch-Geometric ====================
-def install_torch_and_geometric(dry_run: bool = False, retry: int = 5, python_version: str = None, platform_tags: List[str] = None) -> bool:
+# ==================== Torch & Geometric installer ====================
+def install_torch_and_geometric(dry_run: bool = False, retry: int = 5, python_tag: str = None, platform_tags: List[str] = None) -> bool:
     cuda_mapping = {
         "10.2": "cu102", "11.0": "cu110", "11.1": "cu111", "11.2": "cu112",
         "11.3": "cu113", "11.4": "cu114", "11.5": "cu115", "11.6": "cu116",
@@ -531,94 +558,93 @@ def install_torch_and_geometric(dry_run: bool = False, retry: int = 5, python_ve
         import torch
         torch_version = torch.__version__.split("+")[0]
         logger.info(f"PyTorch {torch_version} ติดตั้งแล้ว")
-        device_type, cuda_short = detect_hardware()
-    except ImportError:
+    except Exception:
+        torch_version = None
+
+    device_type, cuda_short = detect_hardware()
+    index_url = None
+    if device_type == "cuda" and cuda_short:
+        index_url = f"https://download.pytorch.org/whl/{cuda_short}"
+    elif device_type == "mps":
+        index_url = None
+    else:
+        cuda_short = "cpu"
+
+    # install torch if not present
+    if not torch_version:
         if dry_run:
             logger.info("[Dry Run] จะติดตั้ง PyTorch")
-            return True
-        device_type, cuda_short = detect_hardware()
-        index_url = None
-        if device_type == "cuda" and cuda_short in cuda_mapping.values():
-            index_url = f"https://download.pytorch.org/whl/{cuda_short}"
-        elif device_type == "cuda":
-            cuda_version = cuda_short[2:] if cuda_short else None
-            if cuda_version:
-                cuda_version_float = float(".".join(list(cuda_version)[:2]))
-                supported_versions = sorted([float(v) for v in cuda_mapping.keys()])
-                closest_version = min(supported_versions, key=lambda x: abs(x - cuda_version_float))
-                cuda_short = cuda_mapping[str(closest_version)]
-                index_url = f"https://download.pytorch.org/whl/{cuda_short}"
-                logger.info(f"เลือก CUDA เวอร์ชันใกล้เคียงที่สุด: {closest_version}")
-            else:
-                cuda_short = "cpu"
-        elif device_type == "mps":
-            index_url = None
+            torch_version = "unknown"
         else:
-            cuda_short = "cpu"
-
-        pkg_spec = "torch torchvision torchaudio"
-        for attempt in range(1, retry + 1):
-            logger.info(f"ติดตั้ง PyTorch (พยายามครั้งที่ {attempt}/{retry})")
-            try:
-                with tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8') as tmp_out, \
-                     tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8') as tmp_err:
-                    cmd = [sys.executable, "-m", "pip", "install"] + pkg_spec.split()
+            # use pip to install torch torchvision torchaudio (index if cuda)
+            pkg_spec = ["torch", "torchvision", "torchaudio"]
+            for attempt in range(1, retry + 1):
+                try:
+                    cmd = [sys.executable, "-m", "pip", "install"] + pkg_spec
                     if index_url:
-                        cmd.extend(["--index-url", index_url])
-                    result = subprocess.run(cmd, stdout=tmp_out, stderr=tmp_err, text=True, check=True)
-                    logger.info(f"ติดตั้ง PyTorch สำเร็จ")
-                    os.unlink(tmp_out.name)
-                    os.unlink(tmp_err.name)
-                    import torch
-                    torch_version = torch.__version__.split("+")[0]
+                        cmd += ["--index-url", index_url]
+                    subprocess.run(cmd, check=True)
+                    import torch as _t
+                    torch_version = _t.__version__.split("+")[0]
+                    logger.info(f"ติดตั้ง PyTorch สำเร็จ: {torch_version}")
                     break
-            except subprocess.CalledProcessError as e:
-                with open(tmp_err.name, 'r', encoding='utf-8') as f:
-                    error_output = f.read()
-                logger.warning(f"พยายามครั้งที่ {attempt} ล้มเหลวในการติดตั้ง PyTorch: {error_output}")
-                os.unlink(tmp_out.name)
-                os.unlink(tmp_err.name)
-                if attempt < retry:
-                    time.sleep(2 * (2 ** (attempt - 1)))
-        else:
-            logger.error(f"ไม่สามารถติดตั้ง PyTorch หลังจากลอง {retry} ครั้ง")
-            return False
+                except Exception as e:
+                    logger.warning(f"ติดตั้ง PyTorch ล้มเหลว (attempt {attempt}): {e}")
+                    if attempt < retry:
+                        time.sleep(2 ** attempt)
+            else:
+                logger.error("ไม่สามารถติดตั้ง PyTorch หลังจากลองหลายครั้ง")
+                return False
 
-    logger.info(f"ตรวจพบอุปกรณ์: {device_type.upper()}")
+    logger.info(f"ตรวจพบอุปกรณ์: {device_type.upper()} (cuda_short={cuda_short})")
 
-    # ติดตั้ง Torch-Geometric และ dependencies
-    required_versions = read_requirements()
-    pyg_version = required_versions.get("torch_geometric") or get_pypi_info("torch_geometric").get("version")
-    pyg_url = f"https://data.pyg.org/whl/torch-{torch_version}+{cuda_short or 'cpu' if device_type != 'mps' else 'cpu'}"
-    pyg_libs = [
-        "torch_scatter", "torch_sparse", "torch_cluster",
-        "torch_spline_conv", "torch_geometric"
-    ]
+    # torch-geometric and its related libs
+    pyg_libs = ["torch_scatter", "torch_sparse", "torch_cluster", "torch_spline_conv", "torch_geometric"]
+    # build pyg index URL if needed
+    pyg_base = None
+    if torch_version and cuda_short:
+        # safe fallback
+        try:
+            pyg_base = f"https://data.pyg.org/whl/torch-{torch_version}+{cuda_short}"
+        except Exception:
+            pyg_base = None
+
     for lib in pyg_libs:
         if dry_run:
-            logger.info(f"[Dry Run] จะติดตั้ง {lib} {required_versions.get(lib) or '(ล่าสุด)'} สำหรับ {device_type}")
+            logger.info(f"[Dry Run] จะติดตั้ง {lib}")
             continue
-        version = required_versions.get(lib) or get_pypi_info(lib).get("version")
-        if not check_wheel_availability(lib, version, python_version, platform_tags):
-            logger.warning(f"ไม่มี wheel สำหรับ {lib}=={version} อาจต้อง build จาก source")
+        # select version from PyPI or let pip choose
+        ver = None
+        try:
+            info = get_pypi_info(lib)
+            if info:
+                ver = info.get("version")
+        except Exception:
+            ver = None
+        # check wheel availability
+        if ver and not check_wheel_availability(lib, ver, platform_tags or []):
+            logger.warning(f"ไม่มี wheel สำหรับ {lib}=={ver} บนแพลตฟอร์มนี้ อาจต้อง build จาก source")
             if not check_and_install_compiler():
                 logger.error(f"ไม่สามารถติดตั้ง {lib} เนื่องจากไม่มี compiler")
                 return False
+        # install
         for attempt in range(1, retry + 1):
             try:
-                ensure_library(lib, version, dry_run, retry=1, index_url=pyg_url)
-                logger.info(f"ติดตั้ง {lib} สำหรับ {device_type} สำเร็จ")
-                break
-            except subprocess.CalledProcessError as e:
-                logger.warning(f"พยายามครั้งที่ {attempt} ล้มเหลวในการติดตั้ง {lib}: {e}")
+                index = pyg_base if pyg_base else None
+                success = install_package(lib, ver, dry_run=False, retry=1, index_url=index)
+                if success:
+                    logger.info(f"ติดตั้ง {lib} สำเร็จ")
+                    break
+            except Exception as e:
+                logger.warning(f"พยายามติดตั้ง {lib} ล้มเหลว (attempt {attempt}): {e}")
                 if attempt < retry:
-                    time.sleep(2 * (2 ** (attempt - 1)))
+                    time.sleep(2 ** attempt)
         else:
             logger.error(f"ไม่สามารถติดตั้ง {lib} หลังจากลอง {retry} ครั้ง")
             return False
     return True
 
-# ==================== ฟังก์ชันอ่าน requirements.txt ====================
+# ==================== Read requirements ====================
 def read_requirements(requirements_file: str = "requirements.txt") -> Dict[str, str]:
     requirements: Dict[str, str] = {}
     if os.path.exists(requirements_file):
@@ -627,14 +653,15 @@ def read_requirements(requirements_file: str = "requirements.txt") -> Dict[str, 
                 for line in f:
                     line = line.strip()
                     if line and "==" in line and not line.startswith("#"):
-                        pkg, ver = line.split("==")
-                        requirements[pkg.strip()] = ver.strip()
+                        pkg, ver = line.split("==", 1)
+                        key = pkg.strip().lower().replace("-", "_")
+                        requirements[key] = ver.strip()
             logger.info("อ่าน requirements.txt สำเร็จ")
         except Exception as e:
             logger.warning(f"ไม่สามารถอ่าน {requirements_file}: {e}")
     return requirements
 
-# ==================== ฟังก์ชันโค้ดโปรเจ็กต์หลัก ====================
+# ==================== Main project code (test run) ====================
 def main_project_code():
     logger.info("เริ่มรันโค้ดโปรเจ็กต์หลัก")
     try:
@@ -647,27 +674,17 @@ def main_project_code():
         from sklearn.linear_model import LinearRegression
         import darts
         import ta
-
         logger.info("ทดสอบการใช้ไลบรารี")
-        logger.info(f"CCXT version: {ccxt.__version__}")
-        logger.info(f"Tenacity version: {tenacity.__version__}")
+        logger.info(f"CCXT version: {getattr(ccxt, '__version__', 'unknown')}")
+        logger.info(f"Tenacity version: {getattr(tenacity, '__version__', 'unknown')}")
         logger.info(f"PyTorch version: {torch.__version__}")
-        logger.info(f"Darts version: {darts.__version__}")
-        logger.info(f"TA version: {ta.__version__}")
-
+        logger.info(f"Darts version: {getattr(darts, '__version__', 'unknown')}")
         df = pd.DataFrame({"x": [1, 2, 3], "y": [2, 4, 6]})
         logger.info(f"Pandas DataFrame:\n{df}")
-
         array = np.array([1, 2, 3])
-        logger.info(f"NumPy array: {array}")
-
         tensor = torch.tensor([1, 2, 3])
-        logger.info(f"PyTorch tensor: {tensor}")
-
         model = LinearRegression()
         model.fit(df[["x"]], df["y"])
-        logger.info(f"Scikit-learn model coefficient: {model.coef_}")
-
         plt.plot(df["x"], df["y"], 'o')
         plt.title("ตัวอย่างกราฟ")
         plt.xlabel("X")
@@ -675,51 +692,49 @@ def main_project_code():
         plt.savefig("example_plot.png")
         plt.close()
         logger.info("บันทึกกราฟตัวอย่างสำเร็จ")
-
         print("โค้ดโปรเจ็กต์หลักทำงานสำเร็จ")
     except Exception as e:
         logger.error(f"เกิดข้อผิดพลาดในโค้ดโปรเจ็กต์หลัก: {e}")
         raise
 
-# ==================== ฟังก์ชันติดตั้งทุกไลบรารีและรันโปรเจ็กต์ ====================
-def auto_install_all(project_dir: str = ".", dry_run: bool = False, max_workers: int = 4, skip_install: bool = False, generate_requirements: bool = True) -> None:
+# ==================== Auto install all ====================
+def auto_install_all(project_dir: str = ".", dry_run: bool = False, max_workers: int = 4, skip_install: bool = False, generate_requirements: bool = True):
     if not check_system_resources():
-        logger.error("ทรัพยากรระบบไม่เพียงพอ กรุณาตรวจสอบ disk space และ RAM")
+        logger.error("ทรัพยากรระบบไม่เพียงพอ")
         sys.exit(1)
-
     if not check_python_version("3.8"):
         logger.error("Python version ไม่เข้ากันได้ ต้องการ >=3.8")
         sys.exit(1)
 
+    # update pip unless dry_run or skip_install
     if not skip_install and not dry_run:
-        self_update()
+        try:
+            self_update()
+        except Exception:
+            pass
 
     config = load_config()
-    dry_run = dry_run or config["dry_run"]
-    max_workers = max_workers or config["max_workers"]
-    ignore_patterns = config["ignore_patterns"]
-    timeout = config["network_timeout"]
-    retry = config["retry_attempts"]
-    backoff_factor = config["backoff_factor"]
+    dry_run = dry_run or config.get("dry_run", False)
+    max_workers = max_workers or config.get("max_workers", 4)
+    ignore_patterns = config.get("ignore_patterns", [])
+    timeout = config.get("network_timeout", 10)
+    retry = config.get("retry_attempts", 5)
+    backoff = config.get("backoff_factor", 2)
+    cache_ttl = config.get("cache_ttl", 3600)
 
-    # ตรวจสอบ Python version และ platform tags
-    python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    python_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
     platform_tags = [platform.system().lower(), platform.machine()]
-    if platform.system() == "Darwin" and platform.machine() == "arm64":
-        platform_tags.append("macosx_11_0_arm64")
 
-    # ติดตั้ง packaging ถ้ายังไม่มี
-    if not pkg_version and not dry_run and not skip_install:
-        ensure_library("packaging")
-        from packaging import version as pkg_version
-        from packaging.requirements import Requirement
+    # ensure packaging present (should be, but best-effort)
+    try:
+        import packaging  # type: ignore
+    except Exception:
+        ensure_library("packaging", dry_run=dry_run)
 
     if skip_install and not dry_run:
-        logger.info("ข้ามการติดตั้งไลบรารี ไปรันโค้ดโปรเจ็กต์หลัก")
         main_project_code()
         return
 
-    # สแกนโปรเจ็กต์เพื่อหาไลบรารี
     project_libs = scan_project_for_libraries(project_dir, ignore_patterns)
     base_libs = {
         "ccxt", "tenacity", "torch", "numpy", "pandas", "scikit-learn",
@@ -731,33 +746,34 @@ def auto_install_all(project_dir: str = ".", dry_run: bool = False, max_workers:
         "json", "argparse", "urllib", "re", "functools", "concurrent", "pathlib",
         "platform", "ctypes", "datetime", "asyncio", "sqlite3", "tempfile"
     }
-    all_libs = base_libs.union(project_libs) - standard_libs
+    all_libs = set([lib.lower().replace("-", "_") for lib in base_libs.union(project_libs)]) - set([s.lower() for s in standard_libs])
 
-    # ตรวจจับฮาร์ดแวร์
     device_type, cuda_version = detect_hardware()
     installed_libs: Dict[str, str] = {}
 
-    # สร้าง requirements.txt ถ้าต้องการ
+    # generate requirements
     if generate_requirements and not dry_run and not os.path.exists("requirements.txt"):
         logger.info("กำลังสร้าง requirements.txt อัตโนมัติ")
-        generate_requirements(all_libs, device_type, cuda_version, python_version, platform_tags, installed_libs)
+        generate_requirements(all_libs, device_type, cuda_version, python_tag, platform_tags, installed_libs)
 
     required_versions = read_requirements()
     failed_libs: List[str] = []
 
     def install_with_progress(lib: str) -> bool:
         index_url = None
-        if lib in ["torch_scatter", "torch_sparse", "torch_cluster", "torch_spline_conv", "torch_geometric"]:
-            index_url = f"https://data.pyg.org/whl/torch-{installed_libs.get('torch', '2.4.1')}+{cuda_version or 'cpu' if device_type != 'mps' else 'cpu'}"
-        version = required_versions.get(lib) or select_compatible_version(lib, device_type, cuda_version, python_version, platform_tags, installed_libs)
+        if lib in {"torch_scatter", "torch_sparse", "torch_cluster", "torch_spline_conv", "torch_geometric"}:
+            index_url = None  # managed in install_torch_and_geometric or set later
+        version = required_versions.get(lib) or select_compatible_version(lib, device_type, cuda_version, python_tag, platform_tags, installed_libs)
         if not version:
             logger.error(f"ไม่สามารถหาเวอร์ชันของ {lib}")
+            failed_libs.append(lib)
             return False
         if check_compatibility(lib, version, installed_libs):
             success = ensure_library(lib, version, dry_run, retry, index_url)
             if success and not dry_run:
                 installed_libs[lib] = version
             return success
+        logger.warning(f"ความเข้ากันไม่ได้สำหรับ {lib}=={version}")
         failed_libs.append(lib)
         return False
 
@@ -765,7 +781,7 @@ def auto_install_all(project_dir: str = ".", dry_run: bool = False, max_workers:
     if not dry_run:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(install_with_progress, lib): lib for lib in all_libs}
-            progress = tqdm(futures, total=len(futures), desc="กำลังติดตั้ง", disable=not tqdm)
+            progress = tqdm(total=len(futures), desc="กำลังติดตั้ง", disable=(tqdm is None))
             for future in as_completed(futures):
                 lib = futures[future]
                 try:
@@ -778,17 +794,17 @@ def auto_install_all(project_dir: str = ".", dry_run: bool = False, max_workers:
             if progress:
                 progress.close()
 
+    # torch/geometric special handling
     if "torch" in all_libs or "torch_geometric" in all_libs:
-        if not install_torch_and_geometric(dry_run, retry, python_version, platform_tags):
+        if not install_torch_and_geometric(dry_run, retry, python_tag, platform_tags):
             failed_libs.append("torch/torch_geometric")
 
     if failed_libs:
-        logger.warning(f"ไม่สามารถติดตั้ง: {', '.join(failed_libs)}")
+        logger.warning(f"ไม่สามารถติดตั้ง: {', '.join(sorted(set(failed_libs)))}")
         logger.info("กรุณาตรวจสอบ auto_installer.log และติดตั้งไลบรารีที่ล้มเหลวด้วยตนเอง")
     else:
         logger.info("ติดตั้งไลบรารีทั้งหมดสำเร็จ")
 
-    # รันโค้ดโปรเจ็กต์หลัก
     if not dry_run:
         try:
             main_project_code()
@@ -796,7 +812,7 @@ def auto_install_all(project_dir: str = ".", dry_run: bool = False, max_workers:
         except Exception as e:
             logger.error(f"รันโค้ดโปรเจ็กต์หลักล้มเหลว: {e}")
 
-# ==================== ฟังก์ชันหลัก ====================
+# ==================== CLI ====================
 def main():
     parser = argparse.ArgumentParser(description="ติดตั้งไลบรารี Python และรันโค้ดโปรเจ็กต์โดยอัตโนมัติ")
     parser.add_argument("--project-dir", default=".", help="โฟลเดอร์โปรเจ็กต์ที่ต้องการสแกน")
