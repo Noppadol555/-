@@ -9,10 +9,13 @@ from transformers import GPT2Model, GPT2Config
 from collections import deque
 import logging
 import logging.handlers
+from config import GlobalConfig
 
 # การตั้งค่าระบบบันทึก log เฉพาะสำหรับคลาสนี้
+log_level_str = GlobalConfig.get('log_level', 'INFO').upper()
+log_level = getattr(logging, log_level_str, logging.INFO)
 logging.basicConfig(
-    level=getattr(logging, GlobalConfig.get('log_level')),
+    level=log_level,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.handlers.RotatingFileHandler('qnetworktransformer.log', maxBytes=10*1024*1024, backupCount=5),
@@ -182,30 +185,30 @@ class QNetworkTransformer(nn.Module):
     def select_action(self, state, epsilon=None):
         """เลือก action ด้วย epsilon-greedy policy
         Args:
-            state (torch.Tensor): State shape [1, timesteps, input_dim]
+            state (torch.Tensor): State shape [batch_size, timesteps, input_dim] or [timesteps, input_dim]
             epsilon (float, optional): Exploration rate หากไม่ระบุใช้ self.epsilon
         Returns:
-            int: Action index
+            int or list: Action index หรือ list ของ action indices หาก batch_size > 1
         """
         epsilon = epsilon if epsilon is not None else self.epsilon
-
         if state.dim() == 2:
-            state = state.unsqueeze(0)  # เพิ่ม batch dimension
+            state = state.unsqueeze(0)
         if state.shape[1:] != (self.timesteps, self.input_dim):
-            logging.error(f"State shape ไม่ถูกต้อง: ได้ {state.shape}, คาดหวัง [1, {self.timesteps}, {self.input_dim}]")
-            raise ValueError(f"State shape ต้องเป็น [1, {self.timesteps}, {self.input_dim}]")
-
-        if torch.rand(1).item() < epsilon:
-            action = torch.randint(0, self.action_space_size, (1,)).item()
-            logging.debug(f"เลือก action แบบสุ่ม: {action}")
-        else:
-            with torch.no_grad():
-                state = state.to(self.device)
-                q_values = self.forward(state)  # [1, action_space_size]
-                action = q_values.argmax(dim=1).item()
-                logging.debug(f"เลือก action จาก Q-values: {action}")
-
-        return action
+            logging.error(f"State shape ไม่ถูกต้อง: ได้ {state.shape}, คาดหวัง [batch_size, {self.timesteps}, {self.input_dim}]")
+            raise ValueError(f"State shape ต้องเป็น [batch_size, {self.timesteps}, {self.input_dim}]")
+        actions = []
+        with torch.no_grad():
+            state = state.to(self.device)
+            q_values = self.forward(state)
+            for i in range(state.size(0)):
+                if torch.rand(1).item() < epsilon:
+                    action = torch.randint(0, self.action_space_size, (1,)).item()
+                    logging.debug(f"เลือก action แบบสุ่มสำหรับ state {i}: {action}")
+                else:
+                    action = q_values[i].argmax().item()
+                    logging.debug(f"เลือก action จาก Q-values สำหรับ state {i}: {action}")
+                actions.append(action)
+        return actions[0] if len(actions) == 1 else actions
 
     def save_model(self, path):
         """บันทึกโมเดลไปยังไฟล์
