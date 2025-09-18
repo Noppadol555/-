@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from collections import deque
+from config import GlobalConfig
 
 class MADRL:
     """
@@ -18,7 +19,7 @@ class MADRL:
         เริ่มต้นคลาส MADRL
         :param state_dim: int → ขนาดของ state (เช่น จำนวน features ต่อ agent)
         :param action_dim: int → ขนาดของ action (เช่น leverage หรือ position size)
-        :param num_agents: int → จำนวน agent (default จาก CONFIG['madrl_agent_count'])
+        :param num_agents: int → จำนวน agent (default จาก GlobalConfig.get('madrl_agent_count'))
         :param symbols: list → รายการ symbols (เช่น ['BTCUSDT', 'ETHUSDT'])
         """
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -27,9 +28,9 @@ class MADRL:
             prop = torch.cuda.get_device_properties(0)
             if '5070 Ti' in prop.name:
                 print(f"Detected RTX 5070 Ti with CUDA capability {prop.major}.{prop.minor}")
-        self.num_agents = min(num_agents or CONFIG['madrl_agent_count'], CONFIG['madrl_agent_count'])
+        self.num_agents = min(num_agents or GlobalConfig.get('madrl_agent_count'), GlobalConfig.get('madrl_agent_count'))
         self.symbols = symbols or []
-        self.max_actions = [CONFIG['max_leverage_per_symbol'].get(s, 125) for s in self.symbols]
+        self.max_actions = [GlobalConfig.get('max_leverage_per_symbol').get(s, 125) for s in self.symbols]
         self.actors = [nn.Sequential(
             nn.Linear(state_dim, 256),
             nn.ReLU(),
@@ -78,7 +79,7 @@ class MADRL:
         states_tensor = torch.FloatTensor(states).to(self.device)
         actions = [self.actors[i](states_tensor[i]).cpu().detach().numpy() * self.max_actions[i] for i in range(self.num_agents)]
         actions_array = np.array(actions)
-        return np.clip(actions_array, CONFIG['min_leverage'], self.max_actions)
+        return np.clip(actions_array, GlobalConfig.get('min_leverage'), self.max_actions)
 
     def train(self, state_batch, action_batch, reward_batch, next_state_batch):
         """
@@ -150,8 +151,8 @@ class MADRL:
         """
         self.symbols = new_symbols
         old_num = self.num_agents
-        self.num_agents = min(len(new_symbols), CONFIG['madrl_agent_count'])
-        self.max_actions = [CONFIG['max_leverage_per_symbol'].get(s, 125) for s in self.symbols]
+        self.num_agents = min(len(new_symbols), GlobalConfig.get('madrl_agent_count'))
+        self.max_actions = [GlobalConfig.get('max_leverage_per_symbol').get(s, 125) for s in self.symbols]
         
         # Trim actors ถ้า num_agents ลดลง
         if self.num_agents < old_num:
@@ -163,20 +164,20 @@ class MADRL:
             # สร้างเพิ่ม
             for _ in range(old_num, self.num_agents):
                 actor = nn.Sequential(
-                    nn.Linear(CONFIG.get('state_dim', 10), 256),  # assume default
+                    nn.Linear(GlobalConfig.get('state_dim', 10), 256),  # assume default
                     nn.ReLU(),
                     nn.Linear(256, 128),
                     nn.ReLU(),
-                    nn.Linear(128, CONFIG.get('action_dim', 1)),  # assume default
+                    nn.Linear(128, GlobalConfig.get('action_dim', 1)),  # assume default
                     nn.Tanh()
                 ).to(self.device)
                 self.actors.append(actor)
                 actor_target = nn.Sequential(
-                    nn.Linear(CONFIG.get('state_dim', 10), 256),
+                    nn.Linear(GlobalConfig.get('state_dim', 10), 256),
                     nn.ReLU(),
                     nn.Linear(256, 128),
                     nn.ReLU(),
-                    nn.Linear(128, CONFIG.get('action_dim', 1)),
+                    nn.Linear(128, GlobalConfig.get('action_dim', 1)),
                     nn.Tanh()
                 ).to(self.device)
                 self.actor_targets.append(actor_target)
@@ -184,7 +185,7 @@ class MADRL:
                 actor_target.load_state_dict(actor.state_dict())
             
             # อัพเดท critic ถ้าจำเป็น (recreate ถ้า dim เปลี่ยน)
-            self._rebuild_critic(CONFIG.get('state_dim', 10), CONFIG.get('action_dim', 1))
+            self._rebuild_critic(GlobalConfig.get('state_dim', 10), GlobalConfig.get('action_dim', 1))
     
     def _rebuild_critic(self, state_dim, action_dim):
         """Rebuild critic ถ้า num_agents เปลี่ยน"""
