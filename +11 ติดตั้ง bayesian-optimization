@@ -10,9 +10,10 @@ import psutil
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
+from config import GlobalConfig
 
 class UnifiedQuantumTrader:
-    def __init__(self, input_dim, discrete_action_size=3, continuous_action_dim=2, num_symbols=CONFIG['madrl_agent_count']):
+    def __init__(self, input_dim, discrete_action_size=3, continuous_action_dim=2, num_symbols=GlobalConfig.get('madrl_agent_count')):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # ตรวจสอบ GPU อัตโนมัติ
         if torch.cuda.is_available():
@@ -49,7 +50,7 @@ class UnifiedQuantumTrader:
         self.wait = 0
         self.adaptive_symbol_selector = {}
         self.current_symbols = ['BTC/USDT'] * num_symbols
-        self.multi_tf_data = {tf: deque(maxlen=1000) for tf in CONFIG['multi_tf_list']}
+        self.multi_tf_data = {tf: deque(maxlen=1000) for tf in GlobalConfig.get('multi_tf_list')}
         self.risk_guardian = RiskGuardian()  # เชื่อมใน main
         self.scaler = torch.cuda.amp.GradScaler()
 
@@ -120,11 +121,11 @@ class UnifiedQuantumTrader:
                 reward_pred = self.tft.predict(multi_tf_states.get(symbol, state.reshape(1, -1)))
                 volatility = np.std(reward_pred)
                 liquidity = ws_data[symbol]['volume']
-                if liquidity >= CONFIG['liquidity_threshold']:
+                if liquidity >= GlobalConfig.get('liquidity_threshold'):
                     scores[symbol] = (meta_score * reward_pred.mean() * volatility * liquidity) / (1 + ws_data[symbol]['funding_rate'])
         sorted_symbols = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        num_coins = max(CONFIG['min_coins_per_trade'], min(CONFIG['max_coins_per_trade'],
-                        int(len(sorted_symbols) * (kpi_tracker.total_profit / CONFIG['target_kpi_daily'] + 0.5))))
+        num_coins = max(GlobalConfig.get('min_coins_per_trade'), min(GlobalConfig.get('max_coins_per_trade'),
+                        int(len(sorted_symbols) * (kpi_tracker.total_profit / GlobalConfig.get('target_kpi_daily') + 0.5))))
         top_symbols = [s[0] for s in sorted_symbols[:num_coins]]
         self.current_symbols = top_symbols
         self.madrl.update_symbols(top_symbols)
@@ -137,9 +138,9 @@ class UnifiedQuantumTrader:
         for symbol in ws_data:
             state = np.array([ws_data[symbol]['close'], ws_data[symbol]['volume'], 0, 0, 0,
                             ws_data[symbol]['funding_rate'], ws_data[symbol]['depth']])
-            for tf in CONFIG['multi_tf_list']:
+            for tf in GlobalConfig.get('multi_tf_list'):
                 self.multi_tf_data[tf].append(state)
-            multi_tf_states[symbol] = {tf: np.array(list(self.multi_tf_data[tf])[-10:]) for tf in CONFIG['multi_tf_list']}
+            multi_tf_states[symbol] = {tf: np.array(list(self.multi_tf_data[tf])[-10:]) for tf in GlobalConfig.get('multi_tf_list')}
         return multi_tf_states
 
     def predict(self, state_data):
@@ -158,7 +159,7 @@ class UnifiedQuantumTrader:
         next_states = np.array(next_states[:batch_size])
         volatility = np.mean([self.replay_buffer.buffer[-1][-2] for _ in range(min(10, len(self.replay_buffer.buffer)))
                             if self.replay_buffer.buffer[-1][-2] is not None]) if self.replay_buffer.buffer else 0.01
-        lr_factor = min(1.0, max(0.1, volatility / CONFIG['min_volatility_threshold']))
+        lr_factor = min(1.0, max(0.1, volatility / GlobalConfig.get('min_volatility_threshold')))
         for opt in [self.qnt.optimizer, self.ddpg.actor_optimizer, self.ddpg.critic_optimizer]:
             for param_group in opt.param_groups:
                 param_group['lr'] = 0.0001 * lr_factor
