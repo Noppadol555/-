@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+from config import GlobalConfig
 
 class MetaSelector(nn.Module):
     def __init__(self, input_dim):
@@ -23,7 +24,7 @@ class MetaSelector(nn.Module):
             nn.ReLU(),
             nn.Linear(32, 1)
         ).to(self.device)
-        self.optimizer = optim.Adam(self.parameters(), lr=CONFIG['maml_lr_outer'])
+        self.optimizer = optim.Adam(self.parameters(), lr=GlobalConfig.get('maml_lr_outer'))
         self.confidence = {}
 
     def forward(self, x):
@@ -41,11 +42,11 @@ class MetaSelector(nn.Module):
         state_batch = torch.FloatTensor(state_batch).to(self.device)
         reward_batch = torch.FloatTensor(reward_batch).to(self.device)
         fast_weights = [p.clone() for p in self.parameters()]
-        for _ in range(CONFIG['maml_steps']):
+        for _ in range(GlobalConfig.get('maml_steps')):
             pred = self.model(state_batch)
             loss = nn.MSELoss()(pred, reward_batch)
             grads = torch.autograd.grad(loss, self.parameters(), create_graph=True)
-            fast_weights = [w - CONFIG['maml_lr_inner'] * g for w, g in zip(fast_weights, grads)]
+            fast_weights = [w - GlobalConfig.get('maml_lr_inner') * g for w, g in zip(fast_weights, grads)]
         for i, state in enumerate(state_batch):
             symbol_key = tuple(state.cpu().numpy())
             self.confidence[symbol_key] = 1 / (loss.item() + 1e-6)
