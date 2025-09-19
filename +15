@@ -5,9 +5,10 @@ import numpy as np
 from collections import deque
 import asyncio
 import logging
+from config import GlobalConfig
 
 class RiskGuardian:
-    def __init__(self, max_drawdown=CONFIG['max_drawdown'], cut_loss_threshold=CONFIG['cut_loss_threshold']):
+    def __init__(self, max_drawdown=GlobalConfig.get('max_drawdown'), cut_loss_threshold=GlobalConfig.get('cut_loss_threshold')):
         self.max_drawdown = max_drawdown
         self.cut_loss_threshold = cut_loss_threshold
         self.drawdown_history = deque(maxlen=1440)
@@ -46,8 +47,8 @@ class RiskGuardian:
         if volatilities:
             avg_volatility = np.std(volatilities)
             self.volatility_history.append(avg_volatility)
-            avg_vol_history = np.mean(self.volatility_history) if self.volatility_history else CONFIG['min_volatility_threshold']
-            self.dynamic_risk_factor = min(2.0, max(0.5, avg_vol_history / CONFIG['min_volatility_threshold']))
+            avg_vol_history = np.mean(self.volatility_history) if self.volatility_history else GlobalConfig.get('min_volatility_threshold')
+            self.dynamic_risk_factor = min(2.0, max(0.5, avg_vol_history / GlobalConfig.get('min_volatility_threshold')))
             logging.debug(f"อัพเดท dynamic risk factor: {self.dynamic_risk_factor:.2f}")
 
     async def emergency_stop(self):
