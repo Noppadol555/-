@@ -3,6 +3,7 @@
 
 import ta
 import pandas as pd
+from config import GlobalConfig
 
 class IndicatorCalculator:
     def __init__(self, multi_tf_data):
@@ -10,7 +11,7 @@ class IndicatorCalculator:
 
     def calculate_indicators(self, symbol):
         indicators = {}
-        for tf in CONFIG['multi_tf_list']:
+        for tf in GlobalConfig.get('multi_tf_list'):
             df = self.multi_tf_data[tf].get(symbol, pd.DataFrame())
             if df.empty:
                 continue
