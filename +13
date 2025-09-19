@@ -6,6 +6,7 @@ import psutil
 import numpy as np
 from collections import deque
 import logging
+from config import GlobalConfig
 
 class IntelligentResourceManager:
     def __init__(self):
@@ -17,10 +18,10 @@ class IntelligentResourceManager:
 
     async def monitor_resources(self):
         process = psutil.Process()
-        while CONFIG['system_running']:
+        while GlobalConfig.get('system_running'):
             self.cpu_usage.append(process.cpu_percent(interval=1))
             self.ram_usage.append(process.memory_info().rss / (1024 * 1024))
-            if CONFIG['resource_adaptive']:
+            if GlobalConfig.get('resource_adaptive'):
                 await self.adjust_resources()
             await asyncio.sleep(60)
 
@@ -28,7 +29,7 @@ class IntelligentResourceManager:
         async with self.resource_lock:
             avg_cpu = np.mean(self.cpu_usage) if self.cpu_usage else 50
             avg_ram = np.mean(self.ram_usage) if self.ram_usage else 1024
-            if avg_cpu > (100 - CONFIG['min_cpu_idle_percent']) or avg_ram > (psutil.virtual_memory().total / (1024 * 1024) - CONFIG['min_ram_reserve_mb']):
+            if avg_cpu > (100 - GlobalConfig.get('min_cpu_idle_percent')) or avg_ram > (psutil.virtual_memory().total / (1024 * 1024) - GlobalConfig.get('min_ram_reserve_mb')):
                 for model in self.model_batch_sizes:
                     self.model_batch_sizes[model] = max(1, int(self.model_batch_sizes[model] * 0.8))
                 logging.info(f"ลด batch size เนื่องจาก CPU={avg_cpu:.1f}%, RAM={avg_ram:.1f}MB")
