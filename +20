@@ -5,13 +5,14 @@ import asyncio
 import gc
 import torch
 import logging
+from config import GlobalConfig
 
 class AutomaticBugFixer:
     def __init__(self):
-        self.attempts_left = CONFIG['bug_fix_attempts']
+        self.attempts_left = GlobalConfig.get('bug_fix_attempts')
 
     async def analyze_and_fix(self, error, trader, env):
-        if not CONFIG['auto_bug_fix'] or self.attempts_left <= 0:
+        if not GlobalConfig.get('auto_bug_fix') or self.attempts_left <= 0:
             return False
         error_str = str(error)
         if "CUDA out of memory" in error_str:
