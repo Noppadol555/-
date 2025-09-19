@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 import ta
 import logging
+from config import GlobalConfig
 
 class RealTimeSimulator:
     def __init__(self, symbols):
@@ -20,14 +21,14 @@ class RealTimeSimulator:
         for symbol in self.symbols:
             if self.data[symbol].empty:
                 df = pd.DataFrame(index=range(1440), columns=['close', 'volume'])
-                df['close'] = 10000 * (1 + np.random.normal(CONFIG['sim_trend'], CONFIG['sim_volatility'], 1440))
+                df['close'] = 10000 * (1 + np.random.normal(GlobalConfig.get('sim_trend'), GlobalConfig.get('sim_volatility'), 1440))
                 df['volume'] = np.random.uniform(50, 500, 1440)
-                if np.random.random() < CONFIG['sim_spike_chance']:
+                if np.random.random() < GlobalConfig.get('sim_spike_chance'):
                     spike_idx = np.random.randint(0, 1440)
                     df.loc[spike_idx, 'close'] *= 1.1
                 self.data[symbol] = df
             else:
-                new_price = self.data[symbol]['close'].iloc[-1] * (1 + np.random.normal(CONFIG['sim_trend'], CONFIG['sim_volatility']))
+                new_price = self.data[symbol]['close'].iloc[-1] * (1 + np.random.normal(GlobalConfig.get('sim_trend'), GlobalConfig.get('sim_volatility')))
                 new_volume = np.random.uniform(50, 500)
                 self.data[symbol].loc[len(self.data[symbol])] = [new_price, new_volume]
         self.step += 1
