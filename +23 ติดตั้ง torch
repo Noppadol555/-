@@ -4,6 +4,7 @@
 import torch
 import numpy as np
 from torch_geometric.data import Data
+from config import GlobalConfig
 
 class DynamicIndicatorGenerator:
     def __init__(self, evogan, gnn, multi_tf_data):
@@ -27,7 +28,7 @@ class DynamicIndicatorGenerator:
     def generate_synthetic_indicators(self, symbol):
         synthetic = {}
         base_ind = self.base_calc.calculate_indicators(symbol)
-        for tf in CONFIG['multi_tf_list']:
+        for tf in GlobalConfig.get('multi_tf_list'):
             if tf not in base_ind:
                 continue
             base_features = np.array([
@@ -52,7 +53,7 @@ class DynamicIndicatorGenerator:
         return synthetic
 
     def _create_asset_graph(self, multi_tf_data):
-        num_assets = len(multi_tf_data[CONFIG['multi_tf_list'][0]])
+        num_assets = len(multi_tf_data[GlobalConfig.get('multi_tf_list')[0]])
         edges = []
         for i in range(num_assets):
             for j in range(i + 1, num_assets):
