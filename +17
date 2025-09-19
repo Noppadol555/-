@@ -2,11 +2,12 @@
 # ไม่ต้องติดตั้งเพิ่ม (ใช้ built-in)
 
 import logging
+from config import GlobalConfig
 
 class KPIOptimizer:
     def __init__(self):
-        self.target_kpi = CONFIG['target_kpi_daily']
-        self.min_kpi = CONFIG['min_daily_kpi']
+        self.target_kpi = GlobalConfig.get('target_kpi_daily')
+        self.min_kpi = GlobalConfig.get('min_daily_kpi')
 
     def optimize(self, current_kpi):
         if current_kpi >= self.target_kpi:
