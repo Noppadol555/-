@@ -5,7 +5,7 @@ import numpy as np
 from collections import deque
 import asyncio
 import logging
-from config import GlobalConfig
+#from config import GlobalConfig
 
 class RiskGuardian:
     def __init__(self, max_drawdown=GlobalConfig.get('max_drawdown'), cut_loss_threshold=GlobalConfig.get('cut_loss_threshold')):
