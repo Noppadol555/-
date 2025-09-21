@@ -1,9 +1,9 @@
-from config import GlobalConfig
-
 # ===============================================
 # ฟังก์ชัน main: รวมทุกคลาสและรันระบบหลัก
 # การใช้งาน: รันระบบทั้งหมด รวมถึงการเทรดจริง/จำลอง, การปรับ leverage, และการซิงค์ข้อมูล
 # ===============================================
+
+#from config import GlobalConfig
 async def main():
     # โหลด CONFIG จาก GlobalConfig (ถ้ามี override จากไฟล์ภายนอก สามารถเรียก GlobalConfig.load_from_file('path/to/config.json'))
     logging.info("เริ่มต้นระบบการเทรดด้วย CONFIG จาก GlobalConfig")
