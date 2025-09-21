@@ -9,7 +9,7 @@ from transformers import GPT2Model, GPT2Config
 from collections import deque
 import logging
 import logging.handlers
-from config import GlobalConfig
+#from config import GlobalConfig
 
 # การตั้งค่าระบบบันทึก log เฉพาะสำหรับคลาสนี้
 log_level_str = GlobalConfig.get('log_level', 'INFO').upper()
