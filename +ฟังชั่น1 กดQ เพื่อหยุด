@@ -3,7 +3,7 @@
 # การใช้งาน: รันใน background เพื่อ monitor keyboard input และหยุดระบบเมื่อกด 'q'
 # ===============================================
 
-from config import GlobalConfig
+#from config import GlobalConfig
 async def control_loop():
     while GlobalConfig.get('system_running'):
         if keyboard.is_pressed('q'):
