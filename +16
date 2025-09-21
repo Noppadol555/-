@@ -3,7 +3,7 @@
 
 import numpy as np
 import logging
-from config import GlobalConfig
+#from config import GlobalConfig
 
 class StrategyGenerator:
     def __init__(self, trader, env, risk_guardian):
