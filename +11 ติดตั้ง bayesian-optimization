@@ -10,7 +10,7 @@ import psutil
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
-from config import GlobalConfig
+#from config import GlobalConfig
 
 class UnifiedQuantumTrader:
     def __init__(self, input_dim, discrete_action_size=3, continuous_action_dim=2, num_symbols=GlobalConfig.get('madrl_agent_count')):
