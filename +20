@@ -5,7 +5,7 @@ import asyncio
 import gc
 import torch
 import logging
-from config import GlobalConfig
+#from config import GlobalConfig
 
 class AutomaticBugFixer:
     def __init__(self):
