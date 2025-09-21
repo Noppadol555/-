@@ -2,7 +2,7 @@
 # ไม่ต้องติดตั้งเพิ่ม (ใช้ built-in)
 
 import logging
-from config import GlobalConfig
+#from config import GlobalConfig
 
 class KPIOptimizer:
     def __init__(self):
