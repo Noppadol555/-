@@ -20,8 +20,8 @@ class GlobalConfig:
         'max_api_retries': 10,                             # จำนวนครั้งสูงสุดที่พยายามเรียก API ใหม่เมื่อล้มเหลว
         'api_timeout': 30,                                 # วินาทีที่รอการตอบกลับจาก API ก่อน timeout
         'rate_limit_per_minute': 2400,                     # จำนวนคำขอ API ต่อนาที (ตาม Binance Futures ในปี 2025: 2400/min per IP)
-        'margin_mode': 'cross',                            # โหมด margin ('cross' หรือ 'isolated')
-        'min_leverage': 5,                                 # Leverage ขั้นต่ำที่ยอมรับ (ปรับอัตโนมัติแต่ไม่ต่ำกว่านี้)
+        'margin_mode': 'isolated',                            # โหมด margin ('cross' หรือ 'isolated')
+        'min_leverage': 50,                                 # Leverage ขั้นต่ำที่ยอมรับ (ปรับอัตโนมัติแต่ไม่ต่ำกว่านี้)
         'trailing_callback_rate': 0.5,                     # เปอร์เซ็นต์ callback สำหรับ Trailing Stop และ Take Profit (เช่น 0.5%)
         'trailing_update_interval': 60,                    # ระยะเวลา (วินาที) สำหรับการอัพเดท Trailing SL/TP อัตโนมัติ
         'sync_time_interval': 3600,                        # ระยะเวลา (วินาที) สำหรับการซิงค์เวลากับเซิร์ฟเวอร์ Binance
@@ -56,9 +56,9 @@ class GlobalConfig:
         'profit_lock_percentage': 0.05,                    # เปอร์เซ็นต์กำไรที่ล็อกเมื่อถึงเป้า (เช่น ล็อกกำไรที่ 5%)
         'loss_strategy': 'dynamic',                        # กลยุทธ์ตัดขาดทุน ('dynamic' = ปรับตาม ATR เพื่อความยืดหยุ่นตามตลาด)
         'stop_loss_percentage': 0.005,                     # เปอร์เซ็นต์ขาดทุนเริ่มต้น (เช่น 0.5% สำหรับ stop loss เริ่มต้น, ปรับตามกลยุทธ์)
-        'cut_loss_threshold': 0.2,                         # ขีดจำกัดขาดทุนสูงสุด (เป็น fraction เช่น 20% ของทุน)
-        'risk_per_trade': 0.2,                             # ความเสี่ยงต่อการเทรดแต่ละครั้ง (เช่น 20% ของทุน, ปรับตาม KPI เพื่อควบคุม drawdown)
-        'max_drawdown': 0.2,                               # เปอร์เซ็นต์ drawdown สูงสุดที่ยอมรับได้ (เช่น 20% ของทุนรวม)
+        'cut_loss_threshold': 0.5,                         # ขีดจำกัดขาดทุนสูงสุด (เป็น fraction เช่น 20% ของทุน)
+        'risk_per_trade': 1.0,                             # ความเสี่ยงต่อการเทรดแต่ละครั้ง (เช่น 20% ของทุน, ปรับตาม KPI เพื่อควบคุม drawdown)
+        'max_drawdown': 1.0,                               # เปอร์เซ็นต์ drawdown สูงสุดที่ยอมรับได้ (เช่น 20% ของทุนรวม)
         'liquidity_threshold': 1000000,                    # ปริมาณการซื้อขายขั้นต่ำ (หน่วย USDT เพื่อให้แน่ใจว่ามี liquidity เพียงพอ)
 
         # ===============================
@@ -86,8 +86,8 @@ class GlobalConfig:
         'bayes_opt_steps': 10,                             # จำนวน iterations สำหรับ Bayesian Optimization (เพื่อหา hyperparameter ที่ดีที่สุด)
         'gnn_update_interval': 900,                        # วินาทีที่อัพเดท GNN graph (เช่น ทุก 15 นาที เพื่อวิเคราะห์ความสัมพันธ์เหรียญ)
         'madrl_agent_count': 50,                           # จำนวน agent สูงสุดใน MADRL (ตามจำนวนเหรียญที่เทรด เพื่อจัดการ multi-agent)
-        'max_coins_per_trade': 15,                         # จำนวนเหรียญสูงสุดที่เทรดพร้อมกัน (เพื่อจำกัด portfolio size)
-        'min_coins_per_trade': 6,                          # จำนวนเหรียญขั้นต่ำที่เทรดพร้อมกัน (เพื่อกระจายความเสี่ยง)
+        'max_coins_per_trade': 3,                         # จำนวนเหรียญสูงสุดที่เทรดพร้อมกัน (เพื่อจำกัด portfolio size)
+        'min_coins_per_trade': 1,                          # จำนวนเหรียญขั้นต่ำที่เทรดพร้อมกัน (เพื่อกระจายความเสี่ยง)
         'maml_lr_inner': 0.01,                             # Learning rate ภายในสำหรับ MAML (เพื่อ fine-tuning รวดเร็ว)
         'maml_lr_outer': 0.001,                            # Learning rate ภายนอกสำหรับ MAML (เพื่ออัพเดท meta-model)
         'maml_steps': 5,                                   # จำนวน steps สำหรับ fine-tuning ใน MAML (เพื่อการเรียนรู้แบบ few-shot)
