@@ -1,9 +1,3 @@
-# ===============================================
-# config.py
-# ไฟล์ตั้งค่า CONFIG กลาง ใช้ร่วมกันทุกคลาส
-# สามารถดึงค่าหรือแก้ไขค่าได้แบบเรียลไทม์
-# ===============================================
-
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -20,8 +14,8 @@ class GlobalConfig:
         'max_api_retries': 10,                             # จำนวนครั้งสูงสุดที่พยายามเรียก API ใหม่เมื่อล้มเหลว
         'api_timeout': 30,                                 # วินาทีที่รอการตอบกลับจาก API ก่อน timeout
         'rate_limit_per_minute': 2400,                     # จำนวนคำขอ API ต่อนาที (ตาม Binance Futures ในปี 2025: 2400/min per IP)
-        'margin_mode': 'isolated',                            # โหมด margin ('cross' หรือ 'isolated')
-        'min_leverage': 50,                                 # Leverage ขั้นต่ำที่ยอมรับ (ปรับอัตโนมัติแต่ไม่ต่ำกว่านี้)
+        'margin_mode': 'isolated',                         # โหมด margin ('cross' หรือ 'isolated')
+        'min_leverage': 50,                                # Leverage ขั้นต่ำที่ยอมรับ (ปรับอัตโนมัติแต่ไม่ต่ำกว่านี้)
         'trailing_callback_rate': 0.5,                     # เปอร์เซ็นต์ callback สำหรับ Trailing Stop และ Take Profit (เช่น 0.5%)
         'trailing_update_interval': 60,                    # ระยะเวลา (วินาที) สำหรับการอัพเดท Trailing SL/TP อัตโนมัติ
         'sync_time_interval': 3600,                        # ระยะเวลา (วินาที) สำหรับการซิงค์เวลากับเซิร์ฟเวอร์ Binance
@@ -48,6 +42,9 @@ class GlobalConfig:
         # ===============================
         'min_volatility_threshold': 0.005,                 # ความผันผวนขั้นต่ำที่ยอมรับสำหรับปรับ learning rate (ใช้ใน SSD)
         'nas_iterations': 100,                             # จำนวน iterations สำหรับ Neural Architecture Search (ใช้ใน EvoGAN)
+        'input_dim': None,                                 # จะคำนวณอัตโนมัติ
+        'action_dim': None,                                # จะคำนวณอัตโนมัติ
+        'num_timeframes': None,                            # จะคำนวณจาก multi_tf_list
 
         # ===============================
         # Trading and Risk Management Parameters
@@ -130,6 +127,7 @@ class GlobalConfig:
         ดึงค่าจาก CONFIG
         :param key: str → ชื่อคีย์ที่ต้องการดึงค่า
         :param default: ค่าเริ่มต้น ถ้าไม่พบ key
+        :return: ค่าที่ดึงได้หรือ default
         """
         return cls.CONFIG.get(key, default)
 
@@ -142,5 +140,18 @@ class GlobalConfig:
         """
         cls.CONFIG[key] = value
         logging.info(f"อัพเดทค่า CONFIG: {key} เป็น {value}")
+        if key == 'multi_tf_list':
+            cls.update_dynamic_params()
+
+    @classmethod
+    def update_dynamic_params(cls):
+        """
+        อัพเดทพารามิเตอร์ที่คำนวณอัตโนมัติ: num_timeframes, input_dim, และ action_dim
+        เมื่อ multi_tf_list เปลี่ยนแปลง
+        """
+        cls.CONFIG['num_timeframes'] = len(cls.CONFIG['multi_tf_list'])
+        cls.CONFIG['input_dim'] = 10 * cls.CONFIG['num_timeframes'] + 5  # 10 base features + 5 synthetic features ต่อ timeframe
+        cls.CONFIG['action_dim'] = 3 + 2  # 3 discrete actions (buy, sell, hold) + 2 continuous (leverage, size)
+        logging.info(f"อัพเดท: num_timeframes={cls.CONFIG['num_timeframes']}, input_dim={cls.CONFIG['input_dim']}, action_dim={cls.CONFIG['action_dim']}")
 
 CONFIG = GlobalConfig.CONFIG
