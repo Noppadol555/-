@@ -14,7 +14,7 @@ from collections import deque
 #from config import GlobalConfig
 
 class MultiMarketEnv(gym.Env):
-    def __init__(self, account_balance=GlobalConfig.get('initial_balance'), risk_per_trade=GlobalConfig.get('risk_per_trade'), dry_run=GlobalConfig.get('dry_run')):
+    def __init__(self, account_balance=GlobalConfig.get('initial_balance'), risk_per_trade=GlobalConfig.get('risk_per_trade'), dry_run=GlobalConfig.get('dry_run'), ws_manager=None, exchange=None):
         super().__init__()
         self.account_balance = account_balance
         self.available_balance = account_balance
@@ -27,6 +27,7 @@ class MultiMarketEnv(gym.Env):
         self.current_step = 0
         self.day_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         self.ws_manager = ws_manager  # เชื่อมจาก main
+        self.exchange = exchange      # เชื่อมจาก main
         self.simulator = RealTimeSimulator(self.symbols)  # เชื่อมจาก main
         self.data = {}
         self.raw_data = {}
@@ -156,6 +157,9 @@ class MultiMarketEnv(gym.Env):
         return 0
 
     async def process_symbol(self, symbol):
+        if not self.ws_manager and not self.dry_run:
+            logging.error("ws_manager ไม่ได้กำหนด")
+            return 0, 0
         current_price = self.ws_manager.get_latest_price(symbol) if not self.dry_run else self.raw_data[symbol]['close'].iloc[-1]
         position = self.positions.get(symbol)
         profit = 0
@@ -181,15 +185,28 @@ class MultiMarketEnv(gym.Env):
         return reward, profit
 
     async def fetch_multi_tf_data(self, symbol):
+        if not self.exchange and not self.dry_run:
+            logging.error("exchange ไม่ได้กำหนด")
+            return
         for tf in GlobalConfig.get('multi_tf_list'):
             if self.dry_run:
-                df = self.simulator.data[symbol]
-                if not df.empty:
+                df = self.simulator.data.get(symbol, pd.DataFrame())
+                if df.empty:
+                    logging.warning(f"ไม่มีข้อมูลจำลองสำหรับ {symbol} ใน {tf}")
+                    self.multi_tf_data[tf][symbol] = pd.DataFrame()
+                else:
                     self.multi_tf_data[tf][symbol] = df.resample(tf).last().tail(10)
             else:
-                klines = await exchange.fetch_ohlcv(symbol, timeframe=tf, limit=10)
-                df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                self.multi_tf_data[tf][symbol] = df
+                try:
+                    klines = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=10)
+                    df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    self.multi_tf_data[tf][symbol] = df
+                except Exception as e:
+                    logging.error(f"ดึงข้อมูล {symbol} ใน {tf} ล้มเหลว: {e}")
+                    self.multi_tf_data[tf][symbol] = pd.DataFrame()
+            if tf not in self.multi_tf_data or symbol not in self.multi_tf_data[tf]:
+                logging.warning(f"ข้อมูลสำหรับ {symbol} ใน {tf} ไม่ได้ถูกตั้งค่า")
+                self.multi_tf_data[tf][symbol] = pd.DataFrame()
 
     async def step(self):
         if self.dry_run:
