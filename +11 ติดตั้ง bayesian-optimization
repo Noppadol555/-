@@ -10,27 +10,29 @@ import psutil
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
-#from config import GlobalConfig
+from config import GlobalConfig
+import logging
+from torch_geometric.data import Data
 
 class UnifiedQuantumTrader:
-    def __init__(self, input_dim, discrete_action_size=3, continuous_action_dim=2, num_symbols=GlobalConfig.get('madrl_agent_count')):
+    def __init__(self, input_dim=None, discrete_action_size=3, continuous_action_dim=2, num_symbols=GlobalConfig.get('madrl_agent_count')):
+        self.input_dim = input_dim or GlobalConfig.get('input_dim') or 25
+        self.discrete_action_size = discrete_action_size
+        self.continuous_action_dim = continuous_action_dim
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # ตรวจสอบ GPU อัตโนมัติ
         if torch.cuda.is_available():
             prop = torch.cuda.get_device_properties(0)
             if '5070 Ti' in prop.name:
                 print(f"Detected RTX 5070 Ti with CUDA capability {prop.major}.{prop.minor}")
-        self.input_dim = input_dim
-        self.discrete_action_size = discrete_action_size
-        self.continuous_action_dim = continuous_action_dim
-        self.qnt = QNetworkTransformer(input_dim, discrete_action_size)
-        self.evogan = EvoGAN(input_dim, discrete_action_size)
-        self.ddpg = DDPG(input_dim, continuous_action_dim, 'BTC/USDT')
-        self.ssd = SSD(input_dim)
-        self.tft = TFTWrapper(input_dim)
-        self.gnn = GNN(input_dim)
-        self.madrl = MADRL(input_dim, continuous_action_dim, num_symbols, symbols=['BTC/USDT']*num_symbols)
-        self.meta_selector = MetaSelector(input_dim)
+        self.qnt = QNetworkTransformer(self.input_dim, discrete_action_size)
+        self.evogan = EvoGAN(self.input_dim, discrete_action_size)
+        self.ddpg = DDPG(self.input_dim, continuous_action_dim, 'BTC/USDT')
+        self.ssd = SSD(self.input_dim)
+        self.tft = TFTWrapper(self.input_dim)
+        self.gnn = GNN(self.input_dim)
+        self.madrl = MADRL(self.input_dim, continuous_action_dim, num_symbols, symbols=['BTC/USDT']*num_symbols)
+        self.meta_selector = MetaSelector(self.input_dim)
         self.replay_buffer = None  # จะเชื่อมใน main
         self.strategy_memory = []
         self.loss_history = {
