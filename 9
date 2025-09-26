@@ -14,7 +14,7 @@ class MADRL:
     ใช้ Actor-Critic architecture กับ multi-agent สำหรับจัดการ portfolio
     """
 
-    def __init__(self, state_dim, action_dim, num_agents=None, symbols=None):
+    def __init__(self, state_dim=None, action_dim=None, num_agents=None, symbols=None):
         """
         เริ่มต้นคลาส MADRL
         :param state_dim: int → ขนาดของ state (เช่น จำนวน features ต่อ agent)
@@ -22,40 +22,42 @@ class MADRL:
         :param num_agents: int → จำนวน agent (default จาก GlobalConfig.get('madrl_agent_count'))
         :param symbols: list → รายการ symbols (เช่น ['BTCUSDT', 'ETHUSDT'])
         """
+        self.state_dim = state_dim or GlobalConfig.get('input_dim') or 25
+        self.action_dim = action_dim or GlobalConfig.get('action_dim') or 2
+        self.num_agents = min(num_agents or GlobalConfig.get('madrl_agent_count'), GlobalConfig.get('madrl_agent_count'))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # ตรวจสอบ GPU อัตโนมัติ
         if torch.cuda.is_available():
             prop = torch.cuda.get_device_properties(0)
             if '5070 Ti' in prop.name:
                 print(f"Detected RTX 5070 Ti with CUDA capability {prop.major}.{prop.minor}")
-        self.num_agents = min(num_agents or GlobalConfig.get('madrl_agent_count'), GlobalConfig.get('madrl_agent_count'))
         self.symbols = symbols or []
         self.max_actions = [GlobalConfig.get('max_leverage_per_symbol').get(s, 125) for s in self.symbols]
         self.actors = [nn.Sequential(
-            nn.Linear(state_dim, 256),
+            nn.Linear(self.state_dim, 256),
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(128, action_dim),
+            nn.Linear(128, self.action_dim),
             nn.Tanh()
         ).to(self.device) for _ in range(self.num_agents)]
         self.actor_targets = [nn.Sequential(
-            nn.Linear(state_dim, 256),
+            nn.Linear(self.state_dim, 256),
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(128, action_dim),
+            nn.Linear(128, self.action_dim),
             nn.Tanh()
         ).to(self.device) for _ in range(self.num_agents)]
         self.critic = nn.Sequential(
-            nn.Linear(state_dim * self.num_agents + action_dim * self.num_agents, 256),
+            nn.Linear(self.state_dim * self.num_agents + self.action_dim * self.num_agents, 256),
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU(),
             nn.Linear(128, 1)
         ).to(self.device)
         self.critic_target = nn.Sequential(
-            nn.Linear(state_dim * self.num_agents + action_dim * self.num_agents, 256),
+            nn.Linear(self.state_dim * self.num_agents + self.action_dim * self.num_agents, 256),
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU(),
@@ -121,8 +123,6 @@ class MADRL:
         for i in range(self.num_agents):
             actions_pred = self.actors[i](state_batch[:, i, :])  # [batch_size, action_dim]
             # สร้าง input สำหรับ actor loss (ใช้ actions จาก agent นี้และ actions อื่นจาก batch)
-            # สำหรับ simplicity, ใช้ average หรือ full concat แต่ปรับให้ถูกต้อง
-            # ที่นี่ใช้ concat กับ dummy actions สำหรับ agents อื่น (ปรับจาก original)
             other_actions = action_batch[:, :i, :].view(action_batch.size(0), -1)
             this_actions_exp = actions_pred.unsqueeze(1).expand(-1, i, -1).view(action_batch.size(0), -1) if i > 0 else torch.zeros(action_batch.size(0), 0).to(self.device)
             post_actions = action_batch[:, i+1:, :].view(action_batch.size(0), -1)
