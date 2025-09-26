@@ -1,5 +1,3 @@
-# คลาสที่ 7: TFTWrapper
-
 # ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
 # pip install torch pandas numpy scikit-learn
 
@@ -13,7 +11,7 @@ from collections import deque
 import logging
 from datetime import datetime
 from torch.cuda.amp import GradScaler, autocast
-#from config import GlobalConfig
+from config import GlobalConfig
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -74,18 +72,24 @@ class TFTWrapper(nn.Module):
     def preprocess_multi_tf(self, multi_tf_data):
         all_series = []
         for tf in GlobalConfig.get('multi_tf_list'):
-            if tf in multi_tf_data and multi_tf_data[tf] is not None and not multi_tf_data[tf].empty:
-                df = pd.DataFrame(multi_tf_data[tf], columns=['close', 'volume', 'RSI', 'MACD', 'RV', 'funding_rate', 'depth'])
-                scaled_data = self.scaler.fit_transform(df)
-                embedded = self.embedding(torch.FloatTensor(scaled_data).unsqueeze(0).to(self.device))  # batch, seq, d_model
-                all_series.append(embedded)
-        if all_series:
-            # Fuse with attention: stack to seq_len=num_tf, batch, d_model
-            stacked = torch.cat(all_series, dim=1)  # batch, total_seq, d_model
-            fused, _ = self.fusion_attention(stacked.transpose(0, 1), stacked.transpose(0, 1), stacked.transpose(0, 1))
-            fused = fused.transpose(0, 1)  # back to batch, seq, d_model
-            return fused
-        return self.preprocess(np.zeros((10, 7)))
+            if tf not in multi_tf_data or not isinstance(multi_tf_data[tf], pd.DataFrame) or multi_tf_data[tf].empty:
+                logging.warning(f"multi_tf_data สำหรับ {tf} ว่างหรือไม่ถูกต้อง")
+                continue
+            if not all(col in multi_tf_data[tf] for col in ['close', 'volume', 'RSI', 'MACD', 'RV', 'funding_rate', 'depth']):
+                logging.warning(f"multi_tf_data สำหรับ {tf} ขาด columns ที่จำเป็น")
+                continue
+            df = multi_tf_data[tf]
+            scaled_data = self.scaler.fit_transform(df)
+            embedded = self.embedding(torch.FloatTensor(scaled_data).unsqueeze(0).to(self.device))
+            all_series.append(embedded)
+        if not all_series:
+            logging.warning("ไม่มีข้อมูล multi_tf_data ที่ถูกต้อง ใช้ default")
+            return self.preprocess(np.zeros((10, 7)))
+        # Fuse with attention: stack to seq_len=num_tf, batch, d_model
+        stacked = torch.cat(all_series, dim=1)  # batch, total_seq, d_model
+        fused, _ = self.fusion_attention(stacked.transpose(0, 1), stacked.transpose(0, 1), stacked.transpose(0, 1))
+        fused = fused.transpose(0, 1)  # back to batch, seq, d_model
+        return fused
 
     def predict(self, state_data):
         if isinstance(state_data, dict):
