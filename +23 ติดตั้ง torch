@@ -1,16 +1,19 @@
 # ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
-# pip install torch numpy torch-geometric
+# pip install torch numpy torch-geometric pandas
 
 import torch
 import numpy as np
+import pandas as pd
+import logging
 from torch_geometric.data import Data
-#from config import GlobalConfig
+# from config import GlobalConfig
 
 class DynamicIndicatorGenerator:
-    def __init__(self, evogan, gnn, multi_tf_data):
+    def __init__(self, evogan, gnn, multi_tf_data, ws_manager=None):
         self.evogan = evogan
         self.gnn = gnn
         self.multi_tf_data = multi_tf_data
+        self.ws_manager = ws_manager
         self.base_calc = IndicatorCalculator(multi_tf_data)
         self.feature_weights = torch.tensor([
             1.0,  # ATR
@@ -27,7 +30,7 @@ class DynamicIndicatorGenerator:
 
     def generate_synthetic_indicators(self, symbol):
         synthetic = {}
-        base_ind = self.base_calc.calculate_indicators(symbol)
+        base_ind = self.calculate_indicators(symbol)
         for tf in GlobalConfig.get('multi_tf_list'):
             if tf not in base_ind:
                 continue
@@ -57,7 +60,92 @@ class DynamicIndicatorGenerator:
         edges = []
         for i in range(num_assets):
             for j in range(i + 1, num_assets):
-                edges.append([i, j])
-                edges.append([j, i])
+                symbol_i = list(multi_tf_data[GlobalConfig.get('multi_tf_list')[0]].keys())[i]
+                symbol_j = list(multi_tf_data[GlobalConfig.get('multi_tf_list')[0]].keys())[j]
+                if self.ws_manager and symbol_i in self.ws_manager.data and symbol_j in self.ws_manager.data:
+                    prices_i = [self.ws_manager.data[symbol_i]['close'] for _ in range(min(10, len(self.ws_manager.data[symbol_i])))]
+                    prices_j = [self.ws_manager.data[symbol_j]['close'] for _ in range(min(10, len(self.ws_manager.data[symbol_j])))]
+                    if len(prices_i) >= 2 and len(prices_j) >= 2:
+                        corr = np.corrcoef(prices_i, prices_j)[0, 1]
+                        if abs(corr) > 0.5:
+                            edges.append([i, j])
+                            edges.append([j, i])
         edge_index = torch.tensor(edges, dtype=torch.long).t().to(self.gnn.device) if edges else torch.tensor([[0, 0]], dtype=torch.long).t().to(self.gnn.device)
         return Data(edge_index=edge_index)
+
+    def calculate_indicators(self, symbol):
+        indicators = {}
+        for tf in GlobalConfig.get('multi_tf_list'):
+            df = self.multi_tf_data[tf].get(symbol, pd.DataFrame())
+            if df.empty or not all(col in df for col in ['close', 'high', 'low', 'volume']):
+                logging.warning(f"ไม่มีข้อมูลสำหรับ {symbol} ใน timeframe {tf}")
+                indicators[tf] = {
+                    'ATR': 0, 'RSI': 50, 'MACD': 0, 'EMA': 0, 'BB_upper': 0, 'BB_lower': 0,
+                    'SMA': 0, 'Stoch_RSI': 0.5, 'OBV': 0, 'Volume': 0
+                }
+                continue
+            # คำนวณ indicators (สมมติว่า IndicatorCalculator มีการคำนวณที่สมบูรณ์)
+            indicators[tf] = self.base_calc.calculate_indicators(symbol)[tf]
+        return indicators
+
+# คลาสตัวช่วยสำหรับการคำนวณ indicators (สมมติว่ามีการใช้งานในโค้ดต้นฉบับ)
+class IndicatorCalculator:
+    def __init__(self, multi_tf_data):
+        self.multi_tf_data = multi_tf_data
+
+    def calculate_indicators(self, symbol):
+        indicators = {}
+        for tf in GlobalConfig.get('multi_tf_list'):
+            df = self.multi_tf_data[tf].get(symbol, pd.DataFrame())
+            if df.empty or not all(col in df for col in ['close', 'high', 'low', 'volume']):
+                indicators[tf] = {
+                    'ATR': 0, 'RSI': 50, 'MACD': 0, 'EMA': 0, 'BB_upper': 0, 'BB_lower': 0,
+                    'SMA': 0, 'Stoch_RSI': 0.5, 'OBV': 0, 'Volume': 0
+                }
+                continue
+            # สมมติว่ามีการคำนวณ indicators จริง
+            indicators[tf] = {
+                'ATR': self._calculate_atr(df),
+                'RSI': self._calculate_rsi(df),
+                'MACD': self._calculate_macd(df),
+                'EMA': self._calculate_ema(df),
+                'BB_upper': self._calculate_bb(df)[0],
+                'BB_lower': self._calculate_bb(df)[1],
+                'SMA': self._calculate_sma(df),
+                'Stoch_RSI': self._calculate_stoch_rsi(df),
+                'OBV': self._calculate_obv(df),
+                'Volume': df['volume'].iloc[-1] if not df.empty else 0
+            }
+        return indicators
+
+    def _calculate_atr(self, df):
+        # สมมติการคำนวณ ATR
+        return 0.0
+
+    def _calculate_rsi(self, df):
+        # สมมติการคำนวณ RSI
+        return 50.0
+
+    def _calculate_macd(self, df):
+        # สมมติการคำนวณ MACD
+        return 0.0
+
+    def _calculate_ema(self, df):
+        # สมมติการคำนวณ EMA
+        return 0.0
+
+    def _calculate_bb(self, df):
+        # สมมติการคำนวณ Bollinger Bands
+        return (0.0, 0.0)
+
+    def _calculate_sma(self, df):
+        # สมมติการคำนวณ SMA
+        return 0.0
+
+    def _calculate_stoch_rsi(self, df):
+        # สมมติการคำนวณ Stochastic RSI
+        return 0.5
+
+    def _calculate_obv(self, df):
+        # สมมติการคำนวณ OBV
+        return 0.0
