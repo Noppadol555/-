@@ -1,0 +1,43 @@
+    async def _handle_message(self, data, websocket):
+        """จัดการข้อมูลจาก public stream (ราคาตลาด, ticker ฯลฯ)"""
+        try:
+            if "data" in data and isinstance(data["data"], dict):
+                msg = data["data"]
+                symbol = msg.get("s")
+                if symbol:
+                    price = float(msg.get("c", 0))
+                    volume = float(msg.get("v", 0))
+                    self.data[symbol] = {
+                        "timestamp": time.time(),
+                        "close": price,
+                        "volume": volume
+                    }
+                    # บันทึกลงฐานข้อมูล SQLite
+                    self.db_conn.execute(
+                        "INSERT INTO ws_data (symbol, timestamp, close, volume, funding_rate, depth) VALUES (?, ?, ?, ?, ?, ?)",
+                        (symbol, time.time(), price, volume, 0, 0)
+                    )
+                    self.db_conn.commit()
+                    logging.info(f"📈 {symbol} = {price:.2f} | Vol={volume:.2f}")
+        except Exception as e:
+            logging.error(f"เกิดข้อผิดพลาดใน _handle_message: {e}")
+
+    async def _handle_user_data(self, data):
+        """จัดการข้อมูลจาก user stream (balance, position, order update)"""
+        try:
+            event_type = data.get("e")
+            if event_type == "ACCOUNT_UPDATE":
+                balances = data["a"]["B"]
+                for b in balances:
+                    if b["a"] == "USDT":
+                        self.balance_data["free"] = float(b["wb"])
+                        self.balance_data["locked"] = float(b["cw"])
+                        logging.info(f"💰 ยอดเงินอัปเดต: free={b['wb']}, locked={b['cw']}")
+            elif event_type == "ORDER_TRADE_UPDATE":
+                symbol = data["o"]["s"]
+                status = data["o"]["X"]
+                price = data["o"]["p"]
+                side = data["o"]["S"]
+                logging.info(f"📊 ออเดอร์ {symbol} {side} สถานะ: {status} ที่ราคา {price}")
+        except Exception as e:
+            logging.error(f"เกิดข้อผิดพลาดใน _handle_user_data: {e}")
