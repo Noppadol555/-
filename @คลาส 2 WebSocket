@@ -50,6 +50,7 @@ class WebSocketManager:
         self.start_time = None
         self.last_data_time = time.time()
         self.all_usdt_pairs = []
+        self.balance_data = {"free": 0.0, "locked": 0.0}
 
         # --------- SQLite ---------
         self.db_conn = sqlite3.connect(GlobalConfig.get("db_path", "market.db"), timeout=10)
@@ -100,6 +101,22 @@ class WebSocketManager:
             "funding_rate": d.get("funding_rate", 0.0),
             "depth": d.get("depth", {}),
         }
+
+    # 🟢 เพิ่มใหม่: คืนค่าราคาล่าสุด
+    def get_latest_price(self, symbol: str) -> float:
+        """คืนค่าราคาล่าสุดของเหรียญ (ใช้ใน MultiMarketEnv หรือ main loop)"""
+        try:
+            return float(self.data.get(symbol, {}).get("close", 0.0))
+        except Exception:
+            return 0.0
+
+    # 🟢 เพิ่มใหม่: คืนค่ายอดเงินล่าสุด
+    def get_latest_balance(self) -> float:
+        """คืนค่ายอดเงินล่าสุด (เชื่อมกับ user stream)"""
+        try:
+            return float(self.balance_data.get("free", GlobalConfig.get("initial_balance", 100.0)))
+        except Exception:
+            return GlobalConfig.get("initial_balance", 100.0)
 
     # ---------------------- ListenKey ----------------------
     async def create_listen_key(self) -> str | None:
@@ -225,7 +242,7 @@ class WebSocketManager:
             vol = float(msg.get("v", 0))
             ts = time.time()
 
-            # ✅ ดึง funding rate จาก REST API (แบบ async) ถ้ายังไม่มีใน cache
+            # ✅ ดึง funding rate จาก REST API (แบบ async)
             funding_rate = await self._safe_fetch_funding_rate(symbol)
 
             # รวมข้อมูลทั้งหมดแบบปลอดภัย
@@ -266,6 +283,8 @@ class WebSocketManager:
             if et == "ACCOUNT_UPDATE":
                 for b in data.get("a", {}).get("B", []):
                     if b.get("a") == "USDT":
+                        self.balance_data["free"] = float(b.get("wb", 0.0))
+                        self.balance_data["locked"] = float(b.get("cw", 0.0))
                         logging.info(f"💰 free={b.get('wb')} locked={b.get('cw')}")
             elif et == "ORDER_TRADE_UPDATE":
                 o = data.get("o", {})
