@@ -1,0 +1,120 @@
+# ===============================================
+# RiskGuardian Class (ต้นฉบับ + ปรับปรุงกันพัง funding_rate)
+# ===============================================
+
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install numpy collections asyncio
+
+import numpy as np
+from collections import deque
+import asyncio
+import logging
+from config import GlobalConfig
+
+
+class RiskGuardian:
+    """
+    คลาสสำหรับประเมินความเสี่ยงของระบบเทรด:
+      - ตรวจจับ drawdown เกินขีดจำกัด
+      - ตรวจสอบการขาดทุนต่อ position
+      - ปรับ dynamic risk ตามความผันผวนตลาด
+      - ปิด position ทั้งหมดเมื่อเกิดภาวะฉุกเฉิน
+    """
+
+    def __init__(
+        self,
+        max_drawdown=GlobalConfig.get('max_drawdown'),
+        cut_loss_threshold=GlobalConfig.get('cut_loss_threshold'),
+        ws_manager=None
+    ):
+        self.max_drawdown = max_drawdown
+        self.cut_loss_threshold = cut_loss_threshold
+        self.drawdown_history = deque(maxlen=1440)
+        self.positions = {}
+        self.total_trades = 0
+        self.failed_trades = 0
+        self.env = None  # เชื่อมจาก main
+        self.dynamic_risk_factor = 1.0
+        self.volatility_history = deque(maxlen=60)
+        self.ws_manager = ws_manager
+
+    # ==========================
+    # ประเมิน Drawdown ปัจจุบัน
+    # ==========================
+    def assess_risk(self, balance, initial_balance):
+        current_drawdown = (initial_balance - balance) / initial_balance
+        self.drawdown_history.append(current_drawdown)
+        if current_drawdown > self.max_drawdown * self.dynamic_risk_factor:
+            logging.warning(
+                f"⚠️ Drawdown เกินขีดจำกัด: {current_drawdown:.2%} > "
+                f"{self.max_drawdown * self.dynamic_risk_factor:.2%}"
+            )
+            return False
+        return True
+
+    # ==========================
+    # ตรวจสอบความเสี่ยงของ position เดียว
+    # ==========================
+    def evaluate_position(self, symbol, current_price, entry_price, size, leverage, side):
+        unrealized_pnl = (current_price - entry_price) * size * leverage * (1 if side == 'BUY' else -1)
+        position_value = size * entry_price / leverage
+        loss_ratio = -unrealized_pnl / position_value
+        adjusted_threshold = self.cut_loss_threshold * self.dynamic_risk_factor
+        if loss_ratio > adjusted_threshold:
+            logging.warning(
+                f"ตำแหน่ง {symbol} ขาดทุนเกิน {adjusted_threshold:.2%}: {loss_ratio:.2%}"
+            )
+            return False
+        return True
+
+    # ==========================
+    # ปรับ dynamic risk factor จากความผันผวนตลาด
+    # ==========================
+    async def update_dynamic_risk(self, ws_data):
+        volatilities = []
+        for symbol in ws_data:
+            if 'close' in ws_data[symbol]:
+                try:
+                    # ตรวจและใช้ funding_rate (หากไม่มี ให้ใช้ค่า 0.0)
+                    funding_rate = ws_data[symbol].get('funding_rate', 0.0)
+                    if 'funding_rate' not in ws_data[symbol]:
+                        logging.debug(f"ไม่มี funding_rate ใน {symbol} → ใช้ค่า 0.0")
+
+                    prev_close = ws_data[symbol].get('prev_close', ws_data[symbol]['close'])
+                    pct_change = (ws_data[symbol]['close'] - prev_close) / ws_data[symbol]['close']
+                    volatilities.append(abs(pct_change) + abs(funding_rate))
+                    ws_data[symbol]['prev_close'] = ws_data[symbol]['close']
+
+                except Exception as e:
+                    logging.warning(f"อัปเดตความผันผวนของ {symbol} ผิดพลาด: {e}")
+                    continue
+
+        if volatilities:
+            avg_volatility = np.std(volatilities)
+            self.volatility_history.append(avg_volatility)
+            avg_vol_history = (
+                np.mean(self.volatility_history)
+                if self.volatility_history
+                else GlobalConfig.get('min_volatility_threshold')
+            )
+            base_threshold = GlobalConfig.get('min_volatility_threshold', 0.001)
+            self.dynamic_risk_factor = min(2.0, max(0.5, avg_vol_history / base_threshold))
+            logging.debug(f"🧠 อัปเดต dynamic risk factor: {self.dynamic_risk_factor:.2f}")
+
+    # ==========================
+    # หยุดระบบทั้งหมดและปิด position ทุกตัว
+    # ==========================
+    async def emergency_stop(self):
+        if not self.env or not self.ws_manager:
+            logging.error("env หรือ ws_manager ไม่พร้อมสำหรับ emergency stop")
+            return
+
+        for symbol in list(self.positions.keys()):
+            try:
+                current_price = self.ws_manager.get_latest_price(symbol)
+                await self.env.close_position_async(symbol, current_price)
+            except Exception as e:
+                logging.error(f"❌ ปิด position {symbol} ผิดพลาด: {e}")
+                continue
+
+        logging.critical("🛑 หยุดฉุกเฉิน: ปิดทุกตำแหน่งเรียบร้อยแล้ว")
