@@ -3,12 +3,17 @@
 # การใช้งาน: รันระบบทั้งหมด รวมถึงการเทรดจริง/จำลอง, การปรับ leverage, และการซิงค์ข้อมูล
 # ===============================================
 
-#from config import GlobalConfig
+from config import GlobalConfig
+import asyncio, logging, traceback
+import numpy as np
+import pandas as pd
+import torch
+
 async def main():
     # โหลด CONFIG จาก GlobalConfig (ถ้ามี override จากไฟล์ภายนอก สามารถเรียก GlobalConfig.load_from_file('path/to/config.json'))
     logging.info("เริ่มต้นระบบการเทรดด้วย CONFIG จาก GlobalConfig")
 
-    # เริ่มต้นคลาสหลักและซิงค์ CONFIG
+    # ---------- สร้างอ็อบเจ็กต์หลัก ----------
     api_manager = APIManager()
     ws_manager = WebSocketManager(exchange=api_manager.exchange, time_offset=api_manager.time_offset)
     trader = UnifiedQuantumTrader(GlobalConfig.get('input_dim'))
@@ -24,26 +29,38 @@ async def main():
     kpi_tracker = KPITracker()
     bug_fixer = AutomaticBugFixer()
 
-    # เริ่มต้น WebSocket และดึงข้อมูล USDT pairs
-    await ws_manager.start(['BTC/USDT'])
+    # ---------- เตรียมสตรีมราคา / เหรียญ ----------
+    # 1) ดึงรายชื่อ USDT pairs ก่อน
     await ws_manager.fetch_all_usdt_pairs()
-    trader.current_symbols = ws_manager.all_usdt_pairs[:GlobalConfig.get('madrl_agent_count')]
+    # 2) เริ่ม WebSocket (ไม่ส่งอาร์กิวเมนต์ เพื่อหลีกเลี่ยง TypeError)
+    await ws_manager.start()
+
+    # เลือกเหรียญเริ่มต้นตามจำนวนเอเจนต์
+    trader.current_symbols = ws_manager.all_usdt_pairs[: GlobalConfig.get('madrl_agent_count')]
     env.symbols = trader.current_symbols
     env.simulator.update_symbols(env.symbols)
     trader.madrl.update_symbols(env.symbols)
 
-    # รัน monitor resources ใน background
+    # ---------- งาน background ----------
     asyncio.create_task(resource_manager.monitor_resources())
 
-    # โหลดข้อมูลย้อนหลังสำหรับเหรียญที่เลือก
+    # ---------- โหลดข้อมูลย้อนหลังสำหรับเหรียญที่เลือก ----------
     for symbol in env.symbols:
         await env.load_historical_data(symbol)
 
-    # เริ่มต้น control_loop ใน background
+    # ---------- เริ่ม control loop ----------
     control_task = asyncio.create_task(control_loop())
 
     # ตั้งสถานะระบบเป็น running
-    GlobalConfig.set('system_running', True)
+    if hasattr(GlobalConfig, "set"):
+        GlobalConfig.set('system_running', True)
+    else:
+        # เผื่อคลาส GlobalConfig ไม่มี set()
+        try:
+            GlobalConfig.CONFIG['system_running'] = True
+        except Exception:
+            pass
+
     step_count = 0
 
     while GlobalConfig.get('system_running'):
@@ -53,42 +70,62 @@ async def main():
                 torch.save(trader.qnt.state_dict(), 'qnt_checkpoint.pth')
                 logging.info(f"บันทึก checkpoint ที่ step {step_count}")
 
-            # เลือกเหรียญ top coins และอัพเดท symbols
+            # เลือกเหรียญ top coins และอัปเดต symbols หากมีการเปลี่ยน
             top_symbols = trader.select_top_coins(ws_manager.all_usdt_pairs, ws_manager.data, kpi_tracker)
             if set(top_symbols) != set(env.symbols):
                 env.symbols = top_symbols
                 env.simulator.update_symbols(top_symbols)
                 trader.madrl.update_symbols(top_symbols)
+                # อัปเดตสตรีมให้ตรงเหรียญใหม่
                 await ws_manager.update_symbols(top_symbols)
 
-            # ดำเนินการ step ใน env (รวม fetch multi_tf_data)
+            # ทำหนึ่งก้าวของสภาพแวดล้อม (รวม fetch multi_tf_data)
             observation, rewards, done, info = await env.step()
 
-            # อัพเดท KPI และปรับ reinvest_cap
-            total_profit = info['profit']
+            # อัปเดต KPI และปรับ reinvest_cap
+            total_profit = info.get('profit', 0.0)
             await kpi_tracker.update(total_profit)
             kpi_factor = kpi_optimizer.optimize(kpi_tracker.daily_profit)
             env.reinvest_cap = env.initial_balance * kpi_factor
 
-            # อัพเดท dynamic risk
+            # อัปเดต dynamic risk
             await risk_guardian.update_dynamic_risk(ws_manager.data)
 
-            # จัดสรร risk weights
+            # คำนวณน้ำหนักความเสี่ยงต่อเหรียญ
             risk_weights = await risk_allocator.allocate_risk(env.symbols, ws_manager.data, kpi_factor)
 
-            # สร้างและดำเนินการ strategy สำหรับแต่ละ symbol
+            # กลยุทธ์รายเหรียญ
             for i, symbol in enumerate(env.symbols):
                 state = observation[i]
-                volatility = np.std([ws_manager.data[symbol]['close']] if symbol in ws_manager.data else [0]) or 0.01
+
+                # ความผันผวน (กันหารด้วยศูนย์)
+                last_close = ws_manager.data.get(symbol, {}).get('close', None)
+                series = [last_close] if last_close is not None else [0.0]
+                volatility = float(np.std(series)) or 0.01
+
+                # สร้างกลยุทธ์จากสถานะล่าสุด
                 strategy = await strategy_gen.generate_strategy(state.reshape(1, -1), symbol, volatility)
                 strategy['size'] *= risk_weights.get(symbol, GlobalConfig.get('risk_per_trade'))
+
+                # ดำเนินการคำสั่ง (จำลองหรือจริงตามโหมด)
                 profit = await strategy_gen.execute_strategy(strategy)
-                multi_tf_data = {tf: env.multi_tf_data[tf].get(symbol, pd.DataFrame()).to_dict()
-                                 for tf in GlobalConfig.get('multi_tf_list', [])}
+
+                # เตรียม multi TF data (ถ้ามี)
+                multi_tf_data = {
+                    tf: env.multi_tf_data[tf].get(symbol, pd.DataFrame()).to_dict()
+                    for tf in GlobalConfig.get('multi_tf_list', [])
+                }
+
+                # พยากรณ์ครั้งเดียวเพื่อลดโหลด
+                pred_discrete, pred_cont = trader.predict(state.reshape(1, -1))
+                action_idx = int(np.argmax(pred_discrete[0]))
+                cont_vec = pred_cont[0]
+
+                # บันทึกลง replay buffer
                 trader.replay_buffer.add(
                     state,
-                    np.argmax(trader.predict(state.reshape(1, -1))[0]),
-                    trader.predict(state.reshape(1, -1))[1][0],
+                    action_idx,
+                    cont_vec,
                     profit,
                     observation[i],
                     None,
@@ -96,17 +133,19 @@ async def main():
                     volatility,
                     multi_tf_data
                 )
+
+                # พัฒนาโมเดลแบบออนไลน์
                 await trader.evolve(state.reshape(1, -1), profit, volatility)
 
-            # ฝึกโมเดลตาม interval
-            if step_count % GlobalConfig.get('rl_train_interval') == 0 and trader.replay_buffer.buffer:
+            # ฝึกโมเดลตามช่วงเวลา
+            if step_count % GlobalConfig.get('rl_train_interval') == 0 and getattr(trader.replay_buffer, "buffer", None):
                 batch = trader.replay_buffer.sample(32)
                 if batch:
                     states, discrete_actions, continuous_actions, rewards, next_states, _, _, atrs, multi_tf_data = batch
                     await trader.train(states, discrete_actions, continuous_actions, rewards, next_states)
                     await trader.adversarial_train(states)
 
-            # ปรับ model weights ด้วย Bayesian Optimization
+            # ปรับน้ำหนักด้วย Bayesian Optimization ตามช่วงเวลา
             if step_count % GlobalConfig.get('auto_ml_interval') == 0:
                 trader.bayes_opt.maximize(init_points=2, n_iter=GlobalConfig.get('bayes_opt_steps'))
                 trader.model_weights = trader.bayes_opt.max['params']
