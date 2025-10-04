@@ -1,11 +1,6 @@
 # ===============================================
-# websocket_manager.py
-# คลาสจัดการ WebSocket สำหรับข้อมูลเรียลไทม์จาก Binance Futures
-# ใช้ Config กลางจาก config.py เท่านั้น
+# websocket_manager.py  (Auto Fetch All USDT Pairs for Binance Futures)
 # ===============================================
-
-# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
-# pip install websockets aiohttp sqlite3 ccxt.async_support tenacity
 
 import json
 import asyncio
@@ -14,343 +9,249 @@ import logging
 import logging.handlers
 import sqlite3
 import websockets
-from collections import deque
-from datetime import datetime, timedelta
 import aiohttp
+from datetime import timedelta
 from tenacity import retry, wait_exponential, stop_after_attempt
-#from config import GlobalConfig  # ดึง GlobalConfig จาก config.py
+from config import GlobalConfig
 
-# การตั้งค่าระบบบันทึก log เฉพาะสำหรับคลาสนี้
+# --------------------------- Logging ---------------------------
 logging.basicConfig(
-    level=getattr(logging, GlobalConfig.get('log_level', 'INFO')),
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=getattr(logging, GlobalConfig.get("log_level", "INFO")),
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.handlers.RotatingFileHandler('websocketmanager.log', maxBytes=10*1024*1024, backupCount=5),
-        logging.StreamHandler()
-    ]
+        logging.handlers.RotatingFileHandler(
+            "websocketmanager.log", maxBytes=10 * 1024 * 1024, backupCount=5
+        ),
+        logging.StreamHandler(),
+    ],
 )
 
+FSTREAM_BASE = "wss://fstream.binance.com"
+DSTREAM_BASE = "wss://dstream.binance.com"
+
+
 class WebSocketManager:
-    def __init__(self, exchange=None, time_offset=0):
-        """เริ่มต้น WebSocketManager
-        Args:
-            exchange: อินสแตนซ์ของ ccxt.async_support.binance จาก APIManager
-            time_offset: ความแตกต่างของเวลา (มิลลิวินาที) จาก APIManager
-        """
-        self.url = GlobalConfig.get('ws_url')
-        self.backup_url = GlobalConfig.get('ws_backup_url')
-        self.data = {}  # เก็บข้อมูลเรียลไทม์จาก WebSocket
+    """WebSocket Manager สำหรับ Binance Futures"""
+
+    def __init__(self, exchange=None, time_offset: int = 0):
+        self.public_base = FSTREAM_BASE
+        self.backup_base = DSTREAM_BASE
+        self.exchange = exchange
+        self.time_offset = time_offset
+
         self.running = False
         self.subscribed_symbols = set()
         self.reconnect_attempts = 0
-        self.max_reconnects = GlobalConfig.get('max_reconnects')
-        self.cache = {}  # Cache สำหรับข้อมูลล่าสุด
-        self.all_usdt_pairs = []
-        self.db_conn = sqlite3.connect(GlobalConfig.get('db_path'), timeout=10)
-        cursor = self.db_conn.cursor()
-        cursor.execute("CREATE TABLE IF NOT EXISTS ws_data (symbol TEXT, timestamp REAL, close REAL, volume REAL, funding_rate REAL, depth REAL)")
-        cursor.execute("CREATE TABLE IF NOT EXISTS historical_data (symbol TEXT, timestamp REAL, open REAL, high REAL, low REAL, close REAL, volume REAL)")
-        self.db_conn.commit()
-        self.balance_data = {'free': GlobalConfig.get('initial_balance', 100), 'locked': 0}  # เก็บยอดเงินเรียลไทม์
-        self.position_data = {}  # เก็บข้อมูลตำแหน่งเรียลไทม์
-        self.exchange = exchange  # อ้างอิง exchange จาก APIManager
-        self.time_offset = time_offset  # ใช้ time_offset จาก APIManager
-        self.multi_tf_data = {tf: deque(maxlen=1000) for tf in GlobalConfig.get('multi_tf_list', [])}  # เก็บ OHLCV aggregate ตาม timeframe
-        self.last_aggregate_time = {tf: time.time() for tf in GlobalConfig.get('multi_tf_list', [])}  # เวลา aggregate ล่าสุดต่อ timeframe
-        self.listen_key = None  # สำหรับ user stream
+        self.max_reconnects = int(GlobalConfig.get("max_reconnects", 10))
 
-    async def create_listen_key(self):
-        """สร้าง listenKey สำหรับ user stream"""
-        if self.listen_key or not self.exchange:
-            return self.listen_key
+        self.data = {}
+        self.cache = {}
+        self.listen_key = None
+        self.start_time = None
+        self.last_data_time = time.time()
+        self.all_usdt_pairs = []  # ✅ เก็บรายการเหรียญทั้งหมดที่ลงท้ายด้วย USDT
+
+        # --------- SQLite ---------
+        self.db_conn = sqlite3.connect(GlobalConfig.get("db_path", "market.db"), timeout=10)
+        self._init_db()
+
+    # --------------------------- DB ---------------------------
+    def _init_db(self):
+        c = self.db_conn.cursor()
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS ws_data (
+                symbol TEXT,
+                timestamp REAL,
+                close REAL,
+                volume REAL,
+                funding_rate REAL,
+                depth REAL
+            )"""
+        )
+        self.db_conn.commit()
+
+    # ---------------------- Fetch all USDT pairs ----------------------
+    async def fetch_all_usdt_pairs(self):
+        """ดึงคู่เหรียญทั้งหมดที่ลงท้ายด้วย USDT จาก Binance Futures"""
+        url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
         try:
-            response = await self.exchange.private_futures_start_user_stream()
-            self.listen_key = response['listenKey']
-            logging.info(f"สร้าง listenKey สำเร็จ: {self.listen_key[:10]}...")
-            return self.listen_key
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    data = await resp.json()
+                    symbols = [
+                        s["symbol"]
+                        for s in data.get("symbols", [])
+                        if s.get("contractType") == "PERPETUAL" and s["symbol"].endswith("USDT")
+                    ]
+                    self.all_usdt_pairs = sorted(symbols)
+                    logging.info(f"✅ ดึงคู่เหรียญ USDT ทั้งหมด {len(symbols)} คู่สำเร็จ")
+        except Exception as e:
+            logging.error(f"❌ ดึงคู่เหรียญ USDT ล้มเหลว: {e}")
+            self.all_usdt_pairs = ["BTCUSDT", "ETHUSDT"]
+
+    # ---------------------- ListenKey ----------------------
+    async def create_listen_key(self) -> str | None:
+        try:
+            api_key = GlobalConfig.get("binance_api_key")
+            if not api_key:
+                logging.warning("⚠️ ไม่มี BINANCE API KEY ใน config; ข้าม user stream")
+                return None
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://fapi.binance.com/fapi/v1/listenKey",
+                    headers={"X-MBX-APIKEY": api_key},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    data = await resp.json()
+                    self.listen_key = data.get("listenKey")
+                    if self.listen_key:
+                        logging.info(f"สร้าง listenKey สำเร็จ: {self.listen_key[:10]}...")
+                    return self.listen_key
         except Exception as e:
             logging.error(f"สร้าง listenKey ล้มเหลว: {e}")
             return None
 
     async def keep_alive_loop(self):
-        """ลูป keep alive user stream ทุก 30 นาที"""
         while self.running:
-            await asyncio.sleep(1800)  # 30 นาที
-            if self.listen_key and self.exchange:
-                try:
-                    await self.exchange.private_futures_keep_alive_user_stream({'listenKey': self.listen_key})
-                    logging.debug("keep alive user stream สำเร็จ")
-                except Exception as e:
-                    logging.error(f"keep alive user stream ล้มเหลว: {e}")
-
-    async def fetch_all_usdt_pairs(self):
-        """ดึงรายการคู่เหรียญ USDT ทั้งหมดจาก Binance Futures"""
-        try:
-            markets = await self.exchange.load_markets()
-            self.all_usdt_pairs = [s for s in markets if s.endswith('USDT') and markets[s].get('swap', False)]
-            logging.info(f"ดึงคู่ USDT ทั้งหมด: {len(self.all_usdt_pairs)} เหรียญ")
-        except Exception as e:
-            logging.error(f"ดึงคู่ USDT ล้มเหลว: {e}")
-            self.all_usdt_pairs = ['BTCUSDT', 'ETHUSDT']  # ค่า default
-
-    async def load_historical_data(self, symbol, years=GlobalConfig.get('historical_years', 5)):
-        """โหลดข้อมูลย้อนหลังสำหรับโหมดจำลอง"""
-        years_ago = datetime.utcnow() - timedelta(days=365 * years)
-        cursor = self.db_conn.cursor()
-        cursor.execute(
-            "SELECT timestamp, open, high, low, close, volume FROM historical_data WHERE symbol=? AND timestamp>=? ORDER BY timestamp ASC",
-            (symbol, years_ago.timestamp())
-        )
-        data = cursor.fetchall()
-        if len(data) < 1000:  # สมมติ limit สำหรับ historical
+            await asyncio.sleep(1800)
+            if not self.listen_key:
+                continue
             try:
-                klines = await self.exchange.fetch_ohlcv(symbol, '1h', since=int(years_ago.timestamp() * 1000), limit=1000)
-                for kline in klines:
-                    timestamp, open_p, high, low, close, volume = kline
-                    self.db_conn.execute(
-                        "INSERT OR IGNORE INTO historical_data (symbol, timestamp, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (symbol, timestamp / 1000, open_p, high, low, close, volume)
+                api_key = GlobalConfig.get("binance_api_key")
+                async with aiohttp.ClientSession() as session:
+                    await session.put(
+                        "https://fapi.binance.com/fapi/v1/listenKey",
+                        headers={"X-MBX-APIKEY": api_key},
+                        timeout=aiohttp.ClientTimeout(total=10),
                     )
-                self.db_conn.commit()
-                logging.info(f"โหลดข้อมูลย้อนหลัง {years} ปีสำหรับ {symbol} สำเร็จ")
-                cursor.execute(
-                    "SELECT timestamp, open, high, low, close, volume FROM historical_data WHERE symbol=? ORDER BY timestamp ASC",
-                    (symbol,)
-                )
-                data = cursor.fetchall()
+                logging.debug("keep alive user stream สำเร็จ")
             except Exception as e:
-                logging.error(f"ดึงข้อมูลย้อนหลังสำหรับ {symbol} ล้มเหลว: {e}")
-                data = [(time.time() - i*3600, 10000, 10100, 9900, 10000, 100) for i in range(1000)]  # จำลองข้อมูล
-        return data
+                logging.error(f"keep alive user stream ล้มเหลว: {e}")
 
-    async def aggregate_to_timeframe(self, symbol, tf, new_data):
-        """รวมข้อมูลเรียลไทม์เป็น OHLCV ตาม timeframe"""
-        tf_seconds = self._tf_to_seconds(tf)
-        current_time = time.time()
-        if current_time - self.last_aggregate_time[tf] >= tf_seconds:
-            close = new_data.get('close', 0)
-            volume = new_data.get('volume', 0)
-            open_p = self.multi_tf_data[tf][-1][1] if self.multi_tf_data[tf] else close
-            high = max(open_p, close)
-            low = min(open_p, close)
-            self.multi_tf_data[tf].append((current_time, open_p, high, low, close, volume))
-            self.last_aggregate_time[tf] = current_time
-            logging.debug(f"Aggregated data for {symbol} in {tf}")
+    async def _listen_user_stream(self, listen_key: str):
+        url = f"{FSTREAM_BASE}/ws/{listen_key}"
+        try:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                logging.info("✅ เชื่อมต่อ user stream สำเร็จ")
+                while self.running:
+                    raw = await ws.recv()
+                    data = json.loads(raw)
+                    await self._handle_user_data(data)
+        except Exception as e:
+            logging.error(f"user stream ล้มเหลว: {e}")
 
-    def _tf_to_seconds(self, tf):
-        """แปลง timeframe เป็นวินาที"""
-        units = {'m': 60, 'h': 3600, 'd': 86400}
-        num = int(''.join(filter(str.isdigit, tf)))
-        unit = tf[-1]
-        return num * units.get(unit, 60)
+    # ---------------------- Public stream helpers ----------------------
+    async def update_symbols(self, symbols: list[str]):
+        new = {s.lower() + "@ticker" for s in symbols}
+        self.subscribed_symbols = set(list(new)[:1024])
+        logging.info(f"📡 ตั้งค่ารายการสัญลักษณ์ {len(self.subscribed_symbols)} streams")
 
-    async def update_symbols(self, symbols):
-        """อัพเดทรายการ symbols ที่สมัครรับข้อมูล"""
-        new_symbols = [s.lower() + '@ticker' for s in symbols]
-        if set(new_symbols) != self.subscribed_symbols:
-            self.subscribed_symbols = set(new_symbols[:1024])  # Binance limit 1024 streams
-            if self.running:
-                await self.resubscribe()
+    def _build_public_url(self, base: str) -> str:
+        streams = "/".join(sorted(self.subscribed_symbols))
+        return f"{base}/stream?streams={streams}"
 
-    async def resubscribe(self, websocket=None):
-        """สมัครรับข้อมูล WebSocket ใหม่"""
-        if websocket:
-            await self.create_listen_key()
-            if self.listen_key:
-                params = [f"{self.listen_key}@arr"] + list(self.subscribed_symbols)
-            else:
-                params = list(self.subscribed_symbols)
-            await websocket.send(json.dumps({
-                'method': 'SUBSCRIBE',
-                'params': params,
-                'id': 1
-            }))
-            logging.info(f"สมัครรับข้อมูลใหม่: {len(self.subscribed_symbols)} streams")
-
-    @retry(wait=wait_exponential(multiplier=1, min=4, max=GlobalConfig.get('reconnect_delay_max', 60)), stop=stop_after_attempt(GlobalConfig.get('max_reconnects', 10)))
-    async def start(self, symbols):
-        """เริ่มต้น WebSocket และรับข้อมูลเรียลไทม์"""
+    # ---------------------- Main start ----------------------
+    @retry(wait=wait_exponential(multiplier=1, min=3, max=60), stop=stop_after_attempt(10))
+    async def start(self):
+        """เริ่มเชื่อมต่อโดยอัตโนมัติ (โหลดคู่ USDT ทั้งหมดก่อน)"""
+        await self.fetch_all_usdt_pairs()
         if not self.all_usdt_pairs:
-            await self.fetch_all_usdt_pairs()
+            logging.error("❌ ไม่พบคู่ USDT ใดๆ")
+            return
+
+        # แบ่งเป็นชุดละ 1024 streams
+        chunks = [self.all_usdt_pairs[i:i + 1024] for i in range(0, len(self.all_usdt_pairs), 1024)]
+
+        # เริ่มทุกชุดพร้อมกัน
+        for idx, chunk in enumerate(chunks):
+            asyncio.create_task(self._start_chunk(chunk, idx))
+
+    async def _start_chunk(self, symbols: list[str], group_idx: int = 0):
+        """เชื่อมต่อ public stream สำหรับชุด symbol"""
         await self.update_symbols(symbols)
         self.running = True
+        self.start_time = time.time()
+
+        asyncio.create_task(self.monitor_status_loop(10))
         asyncio.create_task(self.keep_alive_loop())
-        urls = [self.url, self.backup_url]
-        current_url_idx = 0
+
+        if await self.create_listen_key():
+            asyncio.create_task(self._listen_user_stream(self.listen_key))
+
+        bases = [self.public_base, self.backup_base]
+        idx = 0
+        reconnects = 0
+
         while self.running:
+            url = self._build_public_url(bases[idx])
             try:
-                async with websockets.connect(urls[current_url_idx]) as websocket:
-                    await self.resubscribe(websocket)
-                    self.reconnect_attempts = 0
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                    logging.info(f"✅ [{group_idx}] เชื่อมต่อสำเร็จ {len(symbols)} คู่")
                     while self.running:
-                        message = await asyncio.wait_for(websocket.recv(), timeout=GlobalConfig.get('ws_timeout', 10))
-                        data = json.loads(message)
-                        await self._handle_message(data, websocket)
-            except (websockets.ConnectionClosed, asyncio.TimeoutError) as e:
-                self.reconnect_attempts += 1
-                logging.warning(f"WebSocket ล้มเหลว: {e}, พยายามใหม่ครั้งที่ {self.reconnect_attempts}")
-                if self.reconnect_attempts >= self.max_reconnects:
-                    logging.error("WebSocket ล้มเหลวเกินจำกัด ใช้ข้อมูลสำรอง")
-                    await self.use_fallback_data(symbols)
-                    break
-                await asyncio.sleep(min(5 * self.reconnect_attempts, GlobalConfig.get('reconnect_delay_max', 60)))
-                current_url_idx = (current_url_idx + 1) % len(urls)
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                            data = json.loads(raw)
+                            await self._handle_public_message(data)
+                        except asyncio.TimeoutError:
+                            await ws.ping()
+                            logging.debug(f"[{group_idx}] waiting data...")
             except Exception as e:
-                logging.error(f"ข้อผิดพลาดใน WebSocket: {e}")
-                break
+                reconnects += 1
+                logging.warning(f"[{group_idx}] reconnect {reconnects} : {e}")
+                await asyncio.sleep(min(5 * reconnects, 60))
+                idx = (idx + 1) % len(bases)
 
-    async def stop(self):
-        """หยุด WebSocket และปิดฐานข้อมูลอย่างปลอดภัย"""
-        if self.listen_key and self.exchange:
-            try:
-                await self.exchange.private_futures_close_user_stream({'listenKey': self.listen_key})
-                logging.info("ปิด user stream สำเร็จ")
-            except Exception as e:
-                logging.error(f"ปิด user stream ล้มเหลว: {e}")
-        self.running = False
-        self.db_conn.close()
-        logging.info("หยุด WebSocket และปิดฐานข้อมูลอย่างปลอดภัย")
+    # ---------------------- Handlers ----------------------
+    async def _handle_public_message(self, payload: dict):
+        try:
+            msg = payload.get("data", payload)
+            symbol = msg.get("s")
+            if not symbol:
+                return
+            price = float(msg.get("c", 0))
+            vol = float(msg.get("v", 0))
+            ts = time.time()
+            self.data[symbol] = {"timestamp": ts, "close": price, "volume": vol}
+            self.cache[symbol] = self.data[symbol]
+            self.db_conn.execute(
+                "INSERT INTO ws_data (symbol, timestamp, close, volume, funding_rate, depth) VALUES (?, ?, ?, ?, ?, ?)",
+                (symbol, ts, price, vol, 0, 0),
+            )
+            self.db_conn.commit()
+            logging.info(f"📈 {symbol} = {price:.2f} | Vol={vol:.2f}")
+        except Exception as e:
+            logging.error(f"เกิดข้อผิดพลาดใน _handle_public_message: {e}")
 
-    async def _handle_message(self, data, websocket):
-        """จัดการข้อความจาก WebSocket"""
-        if 'ping' in data:
-            await websocket.send(json.dumps({'pong': data['ping']}))
-            logging.debug("ส่ง pong ตอบ ping จาก Binance")
-        elif 'e' in data:
-            if data['e'] == 'ACCOUNT_UPDATE':
-                self._update_balance(data)
-                self._update_position(data)
-            elif data['e'] == 'ticker':
-                symbol = data['s']
-                new_data = {
-                    'close': float(data.get('c', 0)),
-                    'volume': float(data.get('v', 0)),
-                    'timestamp': (data.get('E', int(time.time() * 1000)) + self.time_offset) / 1000,
-                    'funding_rate': 0.0001,  # Default เนื่องจาก ticker ไม่มี funding_rate
-                    'depth': float(data.get('a', 0)) - float(data.get('b', 0))  # Spread จาก ask - bid
-                }
-                self._update_data(symbol, new_data)
-                await self.save_to_sqlite(new_data, symbol)
-                for tf in GlobalConfig.get('multi_tf_list', []):
-                    await self.aggregate_to_timeframe(symbol, tf, new_data)
+    async def _handle_user_data(self, data: dict):
+        try:
+            et = data.get("e")
+            if et == "ACCOUNT_UPDATE":
+                for b in data.get("a", {}).get("B", []):
+                    if b.get("a") == "USDT":
+                        logging.info(f"💰 free={b.get('wb')} locked={b.get('cw')}")
+            elif et == "ORDER_TRADE_UPDATE":
+                o = data.get("o", {})
+                logging.info(f"📊 {o.get('s')} {o.get('S')} {o.get('X')} @ {o.get('p')}")
+        except Exception as e:
+            logging.error(f"เกิดข้อผิดพลาดใน _handle_user_data: {e}")
 
-    def _update_balance(self, data):
-        """อัพเดทยอดเงินจาก WebSocket"""
-        balances = data.get('a', {}).get('B', [])
-        for bal in balances:
-            if bal.get('a') == 'USDT':
-                self.balance_data = {
-                    'free': float(bal.get('wb', 0)),
-                    'locked': float(bal.get('cw', 0)) - float(bal.get('wb', 0))
-                }
-                logging.debug(f"อัพเดทยอดเงิน USDT: free={self.balance_data['free']}, locked={self.balance_data['locked']}")
-                break
+    # ---------------------- Monitor & Fallback ----------------------
+    async def monitor_status_loop(self, interval: int = 10):
+        while True:
+            self.is_running()
+            await asyncio.sleep(interval)
 
-    def _update_position(self, data):
-        """อัพเดทข้อมูลตำแหน่งจาก WebSocket"""
-        positions = data.get('a', {}).get('P', [])
-        for pos in positions:
-            symbol = pos.get('s')
-            if symbol and float(pos.get('pa', 0)) != 0:
-                leverage = GlobalConfig.get('max_leverage_per_symbol', {}).get(symbol, 125)
-                self.position_data[symbol] = {
-                    'size': float(pos.get('pa', 0)),
-                    'entryPrice': float(pos.get('ep', 0)),
-                    'leverage': leverage,
-                    'marginMode': pos.get('mt', 'cross')
-                }
-                logging.debug(f"อัพเดทตำแหน่ง {symbol}: size={self.position_data[symbol]['size']}, leverage={leverage}")
+    def is_running(self) -> bool:
+        uptime = timedelta(seconds=int(time.time() - self.start_time)) if self.start_time else timedelta(0)
+        delay = time.time() - self.last_data_time
+        if self.running:
+            logging.info(f"✅ ทำงานปกติ | Delay={delay:.1f}s | Uptime={uptime}")
+        else:
+            logging.warning("🛑 หยุดทำงาน")
+        return self.running
 
-    def _update_data(self, symbol, new_data):
-        """อัพเดทข้อมูลเรียลไทม์ใน cache"""
-        self.data[symbol] = new_data
-        self.cache[symbol] = self.data[symbol]
-        if len(self.cache) > GlobalConfig.get('cache_size_max', 1000):
-            self.cache.pop(next(iter(self.cache)))
-
-    async def save_to_sqlite(self, data, symbol):
-        """บันทึกข้อมูล WebSocket ลง SQLite"""
-        cursor = self.db_conn.cursor()
-        cursor.execute(
-            "INSERT INTO ws_data (symbol, timestamp, close, volume, funding_rate, depth) VALUES (?, ?, ?, ?, ?, ?)",
-            (symbol, data['timestamp'], data['close'], data['volume'], data['funding_rate'], data['depth'])
-        )
-        limit = GlobalConfig.get('data_retention_limit', 100)
-        cursor.execute(
-            "DELETE FROM ws_data WHERE symbol=? AND timestamp NOT IN (SELECT timestamp FROM ws_data WHERE symbol=? ORDER BY timestamp DESC LIMIT ?)",
-            (symbol, symbol, limit)
-        )
-        self.db_conn.commit()
-
-    async def fetch_backup_data(self, symbol):
-        """ดึงข้อมูลสำรองจาก SQLite"""
-        cursor = self.db_conn.cursor()
-        cursor.execute(
-            "SELECT close, volume, funding_rate, depth FROM ws_data WHERE symbol=? ORDER BY timestamp DESC LIMIT ?",
-            (symbol, GlobalConfig.get('data_retention_limit', 100))
-        )
-        data = cursor.fetchall()
-        if data:
-            logging.info(f"ดึงข้อมูลสำรองสำหรับ {symbol}: {len(data)} แถว")
-            return data[::-1]
-        return []
-
-    async def use_fallback_data(self, symbols):
-        """ใช้ข้อมูลสำรองเมื่อ WebSocket ล้มเหลว"""
-        for symbol in symbols:
-            backup_data = await self.fetch_backup_data(symbol)
-            if backup_data:
-                last_data = backup_data[-1]
-                self.data[symbol] = {
-                    'close': last_data[0],
-                    'volume': last_data[1],
-                    'timestamp': time.time(),
-                    'funding_rate': last_data[2],
-                    'depth': last_data[3]
-                }
-            else:
-                try:
-                    ticker = await self.exchange.fetch_ticker(symbol)
-                    self.data[symbol] = {
-                        'close': ticker['last'],
-                        'volume': ticker.get('quoteVolume', 0),
-                        'timestamp': time.time(),
-                        'funding_rate': 0.0001,
-                        'depth': (ticker.get('ask', 0) - ticker.get('bid', 0))
-                    }
-                except Exception as e:
-                    logging.error(f"ดึง ticker สำรองสำหรับ {symbol} ล้มเหลว: {e}")
-                    self.data[symbol] = {
-                        'close': 10000,
-                        'volume': 100,
-                        'timestamp': time.time(),
-                        'funding_rate': 0.0001,
-                        'depth': 0
-                    }
-            logging.info(f"ใช้ข้อมูลสำรองสำหรับ {symbol}: ราคา {self.data[symbol]['close']}")
-
-    def get_latest_price(self, symbol):
-        """ดึงราคาล่าสุดของเหรียญ"""
-        default_price = 10000
-        return self.cache.get(symbol, self.data.get(symbol, {})).get('close', default_price)
-
-    def get_latest_balance(self):
-        """ดึงยอดเงินล่าสุด"""
-        return self.balance_data.get('free', 0)
-
-    async def prefetch_data(self, symbols, timeframes):
-        """ดึงข้อมูลล่วงหน้าสำหรับ timeframe ที่ระบุ"""
-        for symbol in symbols:
-            for tf in timeframes:
-                try:
-                    klines = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=100)
-                    for kline in klines:
-                        timestamp, open_p, high, low, close, volume = kline
-                        self.multi_tf_data[tf].append((timestamp / 1000, open_p, high, low, close, volume))
-                    logging.debug(f"ดึงข้อมูลล่วงหน้าสำหรับ {symbol} ใน {tf} สำเร็จ")
-                except Exception as e:
-                    logging.error(f"ดึงข้อมูลล่วงหน้าสำหรับ {symbol} ใน {tf} ล้มเหลว: {e}")
-
-    async def check_symbol_exists(self, symbol):
-        """ตรวจสอบว่าเหรียญมีอยู่ในรายการ USDT pairs"""
-        return symbol in self.all_usdt_pairs
+    async def use_fallback_data(self, symbols: list[str]):
+        now = time.time()
+        for s in symbols:
+            self.data[s] = {"timestamp": now, "close": 0.0, "volume": 0.0}
+        logging.warning("⚠️ ใช้ข้อมูลจำลองเพื่อให้ระบบทำงานต่อ")
