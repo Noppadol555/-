@@ -1,0 +1,229 @@
+# ===============================================
+# APIManager Class
+# จัดการการเชื่อมต่อ API กับ Binance Futures
+# ใช้ GlobalConfig สำหรับค่าพารามิเตอร์ทั้งหมด
+# ===============================================
+
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งใน terminal ก่อนใช้งาน)
+# pip install ccxt tenacity pandas
+
+import os
+import logging
+import logging.handlers
+import time
+import asyncio
+from collections import deque
+from typing import Optional, Dict, Any, List
+import ccxt.async_support as ccxt_async
+from tenacity import retry, wait_exponential, stop_after_attempt
+import pandas as pd
+# from config import GlobalConfig  # ✅ ให้ซิงค์กับ GlobalConfig ของเจ้านายที่มีอยู่แล้ว
+
+# ---------------- Logging ----------------
+log_level_str = GlobalConfig.get('log_level', 'INFO').upper()
+log_level = getattr(logging, log_level_str, logging.INFO)
+logging.basicConfig(
+    level=log_level,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.handlers.RotatingFileHandler('apimanager.log', maxBytes=10 * 1024 * 1024, backupCount=5),
+        logging.StreamHandler()
+    ]
+)
+
+
+class APIManager:
+    """จัดการการเชื่อมต่อและคำสั่งผ่าน Binance Futures API"""
+
+    def __init__(self):
+        self.weight_used: int = 0
+        self.weight_limit: int = GlobalConfig.get('rate_limit_per_minute')
+        self.last_reset: float = time.time()
+        self.is_rate_limited: bool = False
+        self.ban_until: float = 0
+        self.request_count: int = 0
+        self.rate_limit_status: Dict[str, int] = {}
+        self.kpi_priority_weight: float = 0
+        self.api_call_timestamps: deque = deque(maxlen=GlobalConfig.get('rate_limit_per_minute'))
+        self.time_offset: int = 0
+        self.last_time_sync: float = time.time()
+        self.max_leverage_per_symbol: Dict[str, int] = GlobalConfig.get('max_leverage_per_symbol', {})
+        self.trailing_orders: Dict[str, Dict[str, Any]] = {}
+        self.markets: Optional[Dict] = None
+
+        # ---------- สร้าง Binance Futures Exchange ----------
+        self.exchange = ccxt_async.binance({
+            'apiKey': GlobalConfig.get('binance_api_key'),
+            'secret': GlobalConfig.get('binance_api_secret'),
+            'enableRateLimit': True,
+            'timeout': GlobalConfig.get('api_timeout') * 1000,
+            'options': {
+                'defaultType': 'future',
+                'adjustForTimeDifference': True
+            },
+            'rateLimit': int(60000 / GlobalConfig.get('rate_limit_per_minute'))
+        })
+
+    # ============================================================
+    # พื้นฐาน
+    # ============================================================
+
+    async def close(self):
+        """ปิดการเชื่อมต่อ exchange"""
+        if self.exchange:
+            await self.exchange.close()
+
+    async def sync_time_with_exchange(self) -> bool:
+        """ซิงโครไนซ์เวลากับเซิร์ฟเวอร์ Binance"""
+        if GlobalConfig.get('dry_run'):
+            logging.info("จำลองการซิงค์เวลา: timeOffset = 0")
+            self.time_offset = 0
+            self.last_time_sync = time.time()
+            return True
+        await self.rate_limit_control()
+        try:
+            server_time = await self.exchange.fetch_time()
+            local_time = int(time.time() * 1000)
+            self.time_offset = server_time - local_time
+            self.last_time_sync = time.time()
+            logging.info(f"ซิงค์เวลาสำเร็จ: offset = {self.time_offset} ms")
+            return True
+        except Exception as e:
+            logging.error(f"ซิงค์เวลาล้มเหลว: {e}")
+            self.time_offset = 0
+            return False
+
+    async def get_adjusted_timestamp(self) -> int:
+        """คืนค่า timestamp ที่ปรับตาม timeOffset"""
+        return int(time.time() * 1000) + self.time_offset
+
+    async def update_weight(self, response: Any):
+        """อัพเดทน้ำหนัก API"""
+        if time.time() - self.last_reset >= 60:
+            self.weight_used = 0
+            self.rate_limit_status = {}
+            self.last_reset = time.time()
+
+    async def rate_limit_control(self):
+        """ควบคุมการใช้ API"""
+        now = time.time()
+        if now - self.last_time_sync >= GlobalConfig.get('sync_time_interval'):
+            await self.sync_time_with_exchange()
+        if self.is_rate_limited and now < self.ban_until:
+            await asyncio.sleep(self.ban_until - now)
+            self.is_rate_limited = False
+        if self.weight_used >= self.weight_limit * 0.9:
+            wait_time = 60 - (now - self.last_reset)
+            if wait_time > 0:
+                logging.warning(f"น้ำหนัก API ใกล้เต็ม รอ {wait_time:.2f} วิ")
+                await asyncio.sleep(wait_time)
+            self.weight_used = 0
+            self.last_reset = now
+        self.api_call_timestamps.append(now)
+
+    # ============================================================
+    # 🔥 ฟังก์ชันใหม่: ดึงข้อมูลย้อนหลังทุกคู่ USDT
+    # ============================================================
+
+    @retry(wait=wait_exponential(multiplier=1, min=3, max=60), stop=stop_after_attempt(5))
+    async def fetch_all_usdt_historical(
+        self,
+        timeframe: str = "1h",
+        limit: int = 1000,
+        since: Optional[int] = None,
+        delay_per_request: float = 0.2
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        ดึงข้อมูลย้อนหลังของทุกเหรียญที่จับคู่ USDT จาก Binance Futures
+        คืนค่าเป็น dict ของ {symbol: DataFrame}
+        """
+        await self.rate_limit_control()
+        results: Dict[str, pd.DataFrame] = {}
+
+        try:
+            # ---------- โหลดตลาด ----------
+            if not self.markets:
+                self.markets = await self.exchange.load_markets(params={'type': 'future'})
+
+            usdt_pairs: List[str] = [s for s in self.markets if s.endswith('/USDT')]
+            total = len(usdt_pairs)
+            logging.info(f"📊 เริ่มดึงข้อมูลย้อนหลัง {total} เหรียญ (timeframe={timeframe})")
+
+            for idx, symbol in enumerate(usdt_pairs, 1):
+                try:
+                    # ดึงข้อมูล OHLCV
+                    data = await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit, since=since)
+                    df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+                    results[symbol] = df
+                    logging.info(f"[{idx}/{total}] ✅ {symbol}: {len(df)} แถว")
+                except Exception as e:
+                    logging.warning(f"[{idx}/{total}] ⚠️ ดึงข้อมูล {symbol} ล้มเหลว: {e}")
+
+                # ควบคุม rate limit
+                await asyncio.sleep(delay_per_request)
+
+            logging.info(f"✅ ดึงข้อมูลย้อนหลังสำเร็จทั้งหมด {len(results)} เหรียญ")
+            return results
+
+        except Exception as e:
+            logging.error(f"❌ fetch_all_usdt_historical ล้มเหลว: {e}")
+            return {}
+
+    # ============================================================
+    # ฟังก์ชันอื่น (คงเดิมทุกอย่าง)
+    # ============================================================
+
+    async def fetch_max_leverage(self) -> Dict[str, int]:
+        """ดึงข้อมูล leverage สูงสุดสำหรับแต่ละเหรียญ"""
+        await self.rate_limit_control()
+        if GlobalConfig.get('dry_run'):
+            return self.max_leverage_per_symbol
+        try:
+            info = await self.exchange.fetch_exchange_info(
+                params={'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()}
+            )
+            max_leverage = {}
+            for symbol_info in info['symbols']:
+                symbol = symbol_info['symbol']
+                if symbol.endswith('USDT'):
+                    max_leverage[symbol] = 125
+            self.max_leverage_per_symbol = max_leverage
+            GlobalConfig.set('max_leverage_per_symbol', max_leverage)
+            await self.update_weight(info)
+            logging.info(f"ดึง max_leverage สำเร็จ {len(max_leverage)} เหรียญ")
+            return max_leverage
+        except Exception as e:
+            logging.error(f"ดึง max_leverage ล้มเหลว: {e}")
+            raise
+
+    async def check_balance(self, asset: str = 'USDT') -> Dict:
+        """ตรวจสอบยอดเงินในบัญชี Futures"""
+        await self.rate_limit_control()
+        if GlobalConfig.get('dry_run'):
+            return {'free': 1000.0, 'total': 1000.0}
+        try:
+            balance = await self.exchange.fetch_balance(
+                params={'type': 'future', 'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()}
+            )
+            await self.update_weight(balance)
+            return balance.get(asset, {'free': 0, 'total': 0})
+        except Exception as e:
+            logging.error(f"ตรวจสอบ balance ล้มเหลว: {e}")
+            return {'free': 0, 'total': 0}
+
+    async def check_symbol_exists(self, symbol: str) -> bool:
+        """ตรวจสอบว่าเหรียญมีอยู่ใน Binance Futures"""
+        await self.rate_limit_control()
+        try:
+            if self.markets is None:
+                self.markets = await self.exchange.load_markets(params={'type': 'future'})
+            return symbol in self.markets
+        except Exception as e:
+            logging.error(f"ตรวจสอบ symbol {symbol} ล้มเหลว: {e}")
+            return False
+
+    async def predict_usage(self) -> float:
+        """คาดการณ์การใช้งาน API ในอนาคต (60 วินาทีข้างหน้า)"""
+        usage_history = [self.weight_used] * 60
+        return sum(usage_history) / len(usage_history) if usage_history else 0
