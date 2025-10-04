@@ -1,0 +1,438 @@
+# ==========================================================
+# MultiMarketEnv (single-file, original structure preserved)
+# ==========================================================
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install gym pandas numpy openpyxl keyboard
+
+import os
+import time
+import gym
+import pandas as pd
+import numpy as np
+import openpyxl  # noqa: F401 (ใช้โดย pandas เป็น engine)
+import sqlite3
+from datetime import datetime, timedelta
+import asyncio
+import logging
+import keyboard  # noqa: F401 (เผื่อใช้ hotkey ภายนอก)
+from collections import deque  # noqa: F401
+from config import GlobalConfig  # ✅ ใช้งานจริงในคลาสนี้
+
+# ---------------------- ค่าเริ่มต้นที่ต้องมี ----------------------
+# (ดึงจาก GlobalConfig ได้ ถ้าไม่มีให้ใช้ค่า fallback)
+TIMESTEPS = GlobalConfig.get('timesteps', 10)
+TAKER_FEE = GlobalConfig.get('taker_fee', 0.0004)
+SLIPPAGE_DEFAULT = GlobalConfig.get('slippage_default', 0.0005)
+
+
+class MultiMarketEnv(gym.Env):
+    def __init__(
+        self,
+        account_balance=GlobalConfig.get('initial_balance'),
+        risk_per_trade=GlobalConfig.get('risk_per_trade'),
+        dry_run=GlobalConfig.get('dry_run'),
+        ws_manager=None,
+        exchange=None,
+    ):
+        super().__init__()
+        self.account_balance = account_balance
+        self.available_balance = account_balance
+        self.reinvest_cap = account_balance * 2
+        self.initial_balance = GlobalConfig.get('initial_balance')
+        self.risk_per_trade = risk_per_trade
+        self.dry_run = dry_run
+
+        self.symbols = []
+        self.positions = {}
+        self.current_step = 0
+        self.day_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # อ้างอิงอ็อบเจ็กต์ภายนอก (เชื่อมจาก main)
+        self.ws_manager = ws_manager
+        self.exchange = exchange
+
+        # หมายเหตุ: RealTimeSimulator / KPITracker / KPIOptimizer / DynamicIndicatorGenerator
+        # ต้องมีอยู่ในโปรเจกต์ตามต้นฉบับเดิม
+        self.simulator = RealTimeSimulator(self.symbols)  # เชื่อมจาก main
+
+        self.data = {}
+        self.raw_data = {}
+        self.scalers = {}
+        self.trader = None  # เชื่อมจาก main
+
+        self.trade_log_file = GlobalConfig.get('trade_log_file')
+        self.db_conn = sqlite3.connect('env_history.db', timeout=10)
+        self.db_conn.execute(
+            "CREATE TABLE IF NOT EXISTS returns (id INTEGER PRIMARY KEY, step INT, return REAL, timestamp REAL)"
+        )
+        self.db_conn.execute(
+            "CREATE TABLE IF NOT EXISTS historical_data (id INTEGER PRIMARY KEY, symbol TEXT, timestamp REAL, close REAL, volume REAL, funding_rate REAL, depth REAL)"
+        )
+
+        # สร้างไฟล์ Excel ถ้ายังไม่มี
+        if self.trade_log_file and not os.path.exists(self.trade_log_file):
+            pd.DataFrame(
+                columns=[
+                    'DateTime',
+                    'Symbol',
+                    'TradeType',
+                    'BuyPrice',
+                    'SellPrice',
+                    'Quantity',
+                    'Capital',
+                    'ProfitLoss',
+                ]
+            ).to_excel(self.trade_log_file, index=False)
+
+        self.min_kpi_threshold = GlobalConfig.get('min_daily_kpi')
+        self.multi_tf_data = {tf: {} for tf in GlobalConfig.get('multi_tf_list')}
+        self.kpi_tracker = KPITracker()        # เชื่อมจาก main
+        self.kpi_optimizer = KPIOptimizer()    # เชื่อมจาก main
+        self.balance_last_updated = 0
+
+    async def load_historical_data(self, symbol, years=GlobalConfig.get('historical_years')):
+        years_ago = datetime.utcnow() - timedelta(days=365 * years)
+        with self.db_conn:
+            cursor = self.db_conn.execute(
+                "SELECT timestamp, close, volume, funding_rate, depth FROM historical_data WHERE symbol=? AND timestamp>=? ORDER BY timestamp ASC",
+                (symbol, years_ago.timestamp()),
+            )
+            data = cursor.fetchall()
+
+            # ถ้าข้อมูลใน DB น้อย และเป็นโหมดเทรดจริง ให้ดึงจาก exchange มาเติม
+            if len(data) < TIMESTEPS and not self.dry_run and self.exchange:
+                klines = await self.exchange.fetch_ohlcv(
+                    symbol,
+                    timeframe='1h',
+                    since=int(years_ago.timestamp() * 1000),
+                    limit=17520,
+                )
+                for kline in klines:
+                    timestamp, _, _, _, close, volume = kline
+                    self.db_conn.execute(
+                        "INSERT INTO historical_data (symbol, timestamp, close, volume, funding_rate, depth) VALUES (?, ?, ?, ?, ?, ?)",
+                        (symbol, timestamp / 1000, close, volume, 0.0001, 0),
+                    )
+                self.db_conn.commit()
+                cursor = self.db_conn.execute(
+                    "SELECT timestamp, close, volume, funding_rate, depth FROM historical_data WHERE symbol=? AND timestamp>=? ORDER BY timestamp ASC",
+                    (symbol, years_ago.timestamp()),
+                )
+                data = cursor.fetchall()
+
+        return pd.DataFrame(data, columns=['timestamp', 'close', 'volume', 'funding_rate', 'depth']) if data else pd.DataFrame()
+
+    async def transfer_from_spot_to_futures(self):
+        if self.dry_run:
+            shortfall = max(0, GlobalConfig.get('initial_balance') - self.account_balance)
+            self.account_balance += shortfall
+            self.available_balance += shortfall
+            return shortfall
+
+        if not self.exchange:
+            logging.warning("ไม่สามารถโอน Spot→Futures: exchange ไม่ได้ถูกกำหนด")
+            return 0
+
+        spot_balances = await self.exchange.fetch_balance(params={'type': 'spot'})
+        spot_balance = spot_balances.get('USDT', {}).get('free', 0)
+
+        shortfall = max(0, GlobalConfig.get('initial_balance') - self.account_balance)
+        if shortfall > 0 and spot_balance >= shortfall:
+            await self.exchange.transfer('USDT', shortfall, 'spot', 'futures')
+            self.account_balance += shortfall
+            self.available_balance += shortfall
+            logging.info(f"โอน {shortfall:.2f} USDT จาก Spot ไป Futures")
+            return shortfall
+        else:
+            logging.warning(f"ยอด Spot ไม่เพียงพอ: มี {spot_balance:.2f}, ต้องการ {shortfall:.2f}")
+            return 0
+
+    async def execute_trade_async(
+        self,
+        symbol,
+        side,
+        size,
+        leverage,
+        stop_loss,
+        take_profit,
+        trailing_stop=None,
+        trailing_take_profit=None,
+    ):
+        current_time = time.time()
+        if current_time - self.balance_last_updated > 60:
+            if self.ws_manager:
+                self.account_balance = self.ws_manager.get_latest_balance()
+                self.available_balance = self.account_balance
+            if GlobalConfig.get('reinvest_profits'):
+                self.available_balance += getattr(self.kpi_tracker, "total_profit", 0) * 0.5
+            self.balance_last_updated = current_time
+
+        # ราคาอ้างอิง
+        if not self.dry_run:
+            if not self.ws_manager:
+                logging.error("ws_manager ไม่ได้กำหนด (โหมดจริงต้องมีราคาแบบเรียลไทม์)")
+                return 0
+            price = self.ws_manager.get_latest_price(symbol)
+        else:
+            price = self.raw_data.get(symbol, pd.DataFrame()).get('close', pd.Series([0])).iloc[-1]
+
+        required_margin = (size * price) / leverage * (1 + TAKER_FEE + SLIPPAGE_DEFAULT)
+        if required_margin > self.available_balance:
+            logging.warning(f"Margin ไม่พอสำหรับ {symbol}: ต้องการ {required_margin:.2f}, มี {self.available_balance:.2f}")
+            return 0
+
+        if hasattr(self.trader, "risk_guardian"):
+            ok = self.trader.risk_guardian.evaluate_position(symbol, price, price, size, leverage, side)
+            if not ok:
+                logging.warning(f"ตำแหน่ง {symbol} ไม่ผ่านการประเมินความเสี่ยง")
+                return 0
+
+        # โหมดจำลอง: ประเมินกำไรจากอนาคตสั้น ๆ
+        if self.dry_run:
+            future_step = min(self.current_step + 10, len(self.raw_data.get(symbol, pd.DataFrame())) - 1)
+            future_price = self.raw_data.get(symbol, pd.DataFrame()).get('close', pd.Series([price])).iloc[future_step]
+            profit = (future_price - price) * size * leverage * (1 - TAKER_FEE - SLIPPAGE_DEFAULT) * (-1 if side == 'SELL' else 1)
+        else:
+            if not hasattr(self, "api_manager"):
+                logging.warning("api_manager ไม่ถูกกำหนดในโหมดจริง จะถือว่าเปิดออเดอร์ไม่สำเร็จ")
+                return 0
+            await self.api_manager.set_margin_mode(symbol)
+            await self.api_manager.set_leverage(symbol, leverage)
+            callback_rate = GlobalConfig.get('trailing_callback_rate') if trailing_stop else None
+            order = await self.api_manager.create_limit_order_with_trailing(symbol, side, size, price, callback_rate)
+            if order:
+                profit = 0  # *คำนวณจริงตอนปิดสถานะ*
+            else:
+                return 0
+
+        # บันทึกสถานะ
+        self.positions[symbol] = {
+            'size': size,
+            'entry': price,
+            'leverage': leverage,
+            'stop_loss': price * (1 - stop_loss if side == 'BUY' else 1 + stop_loss),
+            'take_profit': price * (1 + take_profit if side == 'BUY' else 1 - take_profit),
+            'side': side,
+            'trailing_stop': trailing_stop,
+            'trailing_take_profit': trailing_take_profit,
+            'highest_price': price if side == 'BUY' else float('inf'),
+            'lowest_price': price if side == 'SELL' else float('-inf'),
+        }
+        self.account_balance -= required_margin
+        self.available_balance -= required_margin
+        self.account_balance += profit
+
+        # Reinvest ถ้ากำไร
+        if GlobalConfig.get('reinvest_profits') and profit > 0:
+            reinvest_amount = min(profit * 0.5, self.reinvest_cap - self.available_balance)
+            self.available_balance += reinvest_amount
+            logging.info(f"Reinvest กำไร {reinvest_amount:.2f} USDT")
+
+        # บันทึก Excel (append)
+        if self.trade_log_file:
+            trade_log = pd.DataFrame(
+                [
+                    {
+                        'วันที่': datetime.utcnow(),
+                        'เหรียญ': symbol,
+                        'ประเภทการเทรด': side,
+                        'ราคาซื้อ': price if side == 'BUY' else 0,
+                        'ราคาขาย': price if side == 'SELL' else 0,
+                        'ปริมาณ': size,
+                        'ทุน': self.account_balance,
+                        'กำไร/ขาดทุน': profit,
+                        'โหมด': 'จำลอง' if self.dry_run else 'จริง',
+                    }
+                ]
+            )
+            with pd.ExcelWriter(self.trade_log_file, mode='a', if_sheet_exists='overlay', engine='openpyxl') as writer:
+                trade_log.to_excel(writer, index=False, header=False)
+
+        return profit
+
+    async def close_position_async(self, symbol, current_price):
+        if self.positions.get(symbol):
+            size = self.positions[symbol]['size']
+            leverage = self.positions[symbol]['leverage']
+            entry = self.positions[symbol]['entry']
+            side = self.positions[symbol]['side']
+            profit = (current_price - entry) * size * leverage * (1 - TAKER_FEE) * (-1 if side == 'SELL' else 1)
+            self.account_balance += profit + (size * entry / leverage)
+            self.available_balance += (size * entry / leverage)
+            del self.positions[symbol]
+            return profit
+        return 0
+
+    async def process_symbol(self, symbol):
+        if not self.ws_manager and not self.dry_run:
+            logging.error("ws_manager ไม่ได้กำหนด")
+            return 0, 0
+
+        if not self.dry_run:
+            current_price = self.ws_manager.get_latest_price(symbol)
+        else:
+            current_price = self.raw_data.get(symbol, pd.DataFrame()).get('close', pd.Series([0])).iloc[-1]
+
+        position = self.positions.get(symbol)
+        profit = 0
+
+        if position:
+            # Trailing Stop
+            if position.get('trailing_stop'):
+                if position['side'] == 'BUY' and current_price > position['highest_price']:
+                    position['highest_price'] = current_price
+                    position['stop_loss'] = current_price - position['trailing_stop']
+                elif position['side'] == 'SELL' and current_price < position['lowest_price']:
+                    position['lowest_price'] = current_price
+                    position['stop_loss'] = current_price + position['trailing_stop']
+
+            # Trailing Take Profit
+            if position.get('trailing_take_profit'):
+                if position['side'] == 'BUY' and current_price > position['highest_price']:
+                    position['highest_price'] = current_price
+                    position['take_profit'] = current_price - position['trailing_take_profit']
+                elif position['side'] == 'SELL' and current_price < position['lowest_price']:
+                    position['lowest_price'] = current_price
+                    position['take_profit'] = current_price + position['trailing_take_profit']
+
+            # เงื่อนไขปิดสถานะ
+            if (
+                position['side'] == 'BUY'
+                and (current_price <= position['stop_loss'] or current_price >= position['take_profit'])
+            ) or (
+                position['side'] == 'SELL'
+                and (current_price >= position['stop_loss'] or current_price <= position['take_profit'])
+            ):
+                profit = await self.close_position_async(symbol, current_price)
+
+        reward = (profit / self.initial_balance) if profit != 0 else 0
+        return reward, profit
+
+    async def fetch_multi_tf_data(self, symbol):
+        if not self.exchange and not self.dry_run:
+            logging.error("exchange ไม่ได้กำหนด")
+            return
+
+        for tf in GlobalConfig.get('multi_tf_list'):
+            if self.dry_run:
+                df = self.simulator.data.get(symbol, pd.DataFrame())
+                if df.empty:
+                    logging.warning(f"ไม่มีข้อมูลจำลองสำหรับ {symbol} ใน {tf}")
+                    self.multi_tf_data[tf][symbol] = pd.DataFrame()
+                else:
+                    # resample ต้องมี DatetimeIndex
+                    if not isinstance(df.index, pd.DatetimeIndex) and 'timestamp' in df.columns:
+                        df = df.copy()
+                        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
+                        df.set_index('timestamp', inplace=True)
+                    self.multi_tf_data[tf][symbol] = df.resample(tf).last().tail(10)
+            else:
+                try:
+                    klines = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=10)
+                    df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    self.multi_tf_data[tf][symbol] = df
+                except Exception as e:
+                    logging.error(f"ดึงข้อมูล {symbol} ใน {tf} ล้มเหลว: {e}")
+                    self.multi_tf_data[tf][symbol] = pd.DataFrame()
+
+            if tf not in self.multi_tf_data or symbol not in self.multi_tf_data[tf]:
+                logging.warning(f"ข้อมูลสำหรับ {symbol} ใน {tf} ไม่ได้ถูกตั้งค่า")
+                self.multi_tf_data[tf][symbol] = pd.DataFrame()
+
+    async def step(self):
+        # โหมดจำลอง: อัปเดตข้อมูลจำลองให้สดใหม่
+        if self.dry_run:
+            self.simulator.simulate_step()
+            for symbol in self.symbols:
+                state_lstm, _, state_ensemble, _, scaler, raw = self.simulator.get_data(symbol)
+                self.data[symbol] = {'lstm': state_lstm, 'ensemble': state_ensemble}
+                self.scalers[symbol] = scaler
+                self.raw_data[symbol] = raw
+
+        # ดึงข้อมูลหลาย timeframe
+        await asyncio.gather(*(self.fetch_multi_tf_data(symbol) for symbol in self.symbols))
+
+        # เติมเงินคืนให้ถึง initial ถ้าต่ำกว่า 90%
+        if self.account_balance < GlobalConfig.get('initial_balance') * 0.9:
+            await self.transfer_from_spot_to_futures()
+
+        # ตรวจวันใหม่และโอนกำไรส่วนเกิน (โหมดจริง)
+        await self.check_new_day()
+
+        # ประมวลผลรายเหรียญ
+        rewards = []
+        total_profit = 0
+        tasks = [self.process_symbol(symbol) for symbol in self.symbols]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logging.error(f"Error processing {self.symbols[i]}: {result}")
+                rewards.append(0)
+            else:
+                reward, profit = result
+                rewards.append(reward)
+                total_profit += profit
+
+        self.current_step += 1
+        done = (
+            self.current_step >= 1440
+            or self.account_balance < self.initial_balance * (1 - GlobalConfig.get('max_drawdown'))
+            or not GlobalConfig.get('system_running')
+        )
+
+        with self.db_conn:
+            self.db_conn.execute(
+                "INSERT INTO returns (step, return, timestamp) VALUES (?, ?, ?)",
+                (self.current_step, total_profit, time.time()),
+            )
+
+        if done:
+            self.reset()
+
+        return self.get_observation(), rewards, done, {'profit': total_profit}
+
+    async def check_new_day(self):
+        now = datetime.utcnow()
+        if now >= self.day_start + timedelta(days=1):
+            excess = max(0, self.account_balance - self.initial_balance)
+            if excess > 0 and not self.dry_run and self.exchange:
+                # โอนกำไรส่วนเกินกลับ Spot
+                try:
+                    await self.exchange.fapiPrivate_post_transfer({'asset': 'USDT', 'amount': excess, 'type': 2})
+                    self.account_balance -= excess
+                    logging.info(f"โอนกำไรส่วนเกิน {excess:.2f} USDT ไป Spot")
+                except Exception as e:
+                    logging.error(f"โอนกำไรส่วนเกินล้มเหลว: {e}")
+            self.day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def get_observation(self):
+        # ต้องมี DynamicIndicatorGenerator และ self.trader ถูกตั้งค่าจากภายนอกตามต้นฉบับ
+        dyn_gen = DynamicIndicatorGenerator(self.trader.evogan, self.trader.gnn, self.multi_tf_data)
+        observations = []
+        for symbol in self.symbols:
+            ind = dyn_gen.generate_synthetic_indicators(symbol)
+            obs = []
+            for tf in GlobalConfig.get('multi_tf_list'):
+                tf_ind = ind.get(
+                    tf,
+                    {
+                        'base': {k: 0 for k in ['ATR', 'RSI', 'MACD', 'EMA', 'BB_upper', 'BB_lower', 'SMA', 'Stoch_RSI', 'OBV', 'Volume']},
+                        'synthetic': np.zeros(10),
+                        'gnn_correlations': np.zeros(5),
+                    },
+                )
+                base_values = list(tf_ind['base'].values())
+                synthetic_values = list(np.array(tf_ind['synthetic']).flatten()[:10])
+                gnn_values = list(np.array(tf_ind['gnn_correlations']).flatten()[:5])
+                obs.extend(base_values + synthetic_values + gnn_values)
+            observations.append(np.array(obs))
+        return np.array(observations)
+
+    def reset(self):
+        self.account_balance = self.initial_balance
+        self.available_balance = self.initial_balance
+        self.positions = {s: None for s in self.symbols}
+        self.current_step = 0
+        if self.dry_run:
+            self.simulator.reset()
