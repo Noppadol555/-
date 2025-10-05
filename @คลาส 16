@@ -1,0 +1,135 @@
+# ==========================================================
+# StrategyGenerator (Enhanced Version - Full Futures Mode)
+# ==========================================================
+# ✅ รองรับ HOLD, LONG, SHORT, CLOSE_LONG, CLOSE_SHORT ครบ
+# ✅ ปลอดภัยต่อการ integrate กับ main.py / env / trader
+# ✅ ไม่แตะต้องส่วนเดิมที่ไม่เกี่ยวข้อง
+# ==========================================================
+
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install numpy
+
+import numpy as np
+import logging
+from config import GlobalConfig  # ✅ ใช้งานจริงในคลาสนี้
+
+class StrategyGenerator:
+    def __init__(self, trader, env, risk_guardian):
+        self.trader = trader
+        self.env = env
+        self.risk_guardian = risk_guardian
+
+        # ✅ Action map ครอบคลุมทุกกรณี Futures
+        # 0 = HOLD       → ถือสถานะ รอจังหวะ
+        # 1 = LONG       → เปิดฝั่ง Long (ซื้อ)
+        # 2 = SHORT      → เปิดฝั่ง Short (ขาย)
+        # 3 = CLOSE_LONG → ปิดฝั่ง Long (ขายออก)
+        # 4 = CLOSE_SHORT→ ปิดฝั่ง Short (ซื้อกลับ)
+        self.action_map = {
+            0: 'HOLD',
+            1: 'LONG',
+            2: 'SHORT',
+            3: 'CLOSE_LONG',
+            4: 'CLOSE_SHORT',
+        }
+
+    # ==========================================================
+    # 🔹 generate_strategy()
+    # ==========================================================
+    async def generate_strategy(self, state, symbol, volatility):
+        """
+        ใช้โมเดลทำนาย action และ continuous output (เช่น leverage, size)
+        จากนั้นสร้าง dict กลยุทธ์สำหรับดำเนินการในตลาด Futures
+        """
+        # ทำนาย action และค่าต่อเนื่องจากโมเดล
+        discrete_pred, continuous_pred = self.trader.predict(state)
+        action_idx = int(np.argmax(discrete_pred[0]))
+        action = self.action_map.get(action_idx, 'HOLD')
+
+        leverage, size = continuous_pred[0]
+
+        # ✅ ตรวจสอบทิศทาง (side)
+        if action in ['LONG']:
+            side = 'LONG'
+        elif action in ['SHORT']:
+            side = 'SHORT'
+        elif action in ['CLOSE_LONG']:
+            side = 'CLOSE_LONG'
+        elif action in ['CLOSE_SHORT']:
+            side = 'CLOSE_SHORT'
+        else:
+            side = 'FLAT'
+
+        # คำนวณ Stop Loss / Take Profit ตาม volatility
+        stop_loss = GlobalConfig.get('stop_loss_percentage') * (
+            1 + volatility / max(GlobalConfig.get('min_volatility_threshold'), 1e-8)
+        )
+        take_profit = stop_loss * 2
+
+        # ✅ ส่งออกกลยุทธ์ครบทุก key
+        return {
+            'action': action,
+            'side': side,
+            'symbol': symbol,
+            'size': float(size),
+            'leverage': min(
+                float(leverage),
+                GlobalConfig.get('max_leverage_per_symbol', {}).get(symbol, 125)
+            ),
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'trailing_stop': (
+                stop_loss if volatility > GlobalConfig.get('min_volatility_threshold') else None
+            ),
+            'trailing_take_profit': (
+                take_profit if volatility > GlobalConfig.get('min_volatility_threshold') else None
+            ),
+        }
+
+    # ==========================================================
+    # 🔹 execute_strategy()
+    # ==========================================================
+    async def execute_strategy(self, strategy):
+        """
+        ดำเนินการเทรดตามกลยุทธ์ที่ได้รับ:
+        HOLD → ข้าม
+        LONG → เปิด Long
+        SHORT → เปิด Short
+        CLOSE_LONG / CLOSE_SHORT → ปิดสถานะเดิม
+        """
+        # ✅ HOLD หรือไม่ผ่าน Risk Check จะไม่ทำการเทรด
+        if strategy['action'] == 'HOLD' or not self.risk_guardian.assess_risk(
+            self.env.account_balance, self.env.initial_balance
+        ):
+            return 0
+
+        # ✅ ระบุทิศทางคำสั่งที่เหมาะสมสำหรับ Futures
+        #   LONG        → BUY
+        #   SHORT       → SELL
+        #   CLOSE_LONG  → SELL
+        #   CLOSE_SHORT → BUY
+        if strategy['action'] in ['LONG', 'CLOSE_SHORT']:
+            order_side = 'BUY'
+        elif strategy['action'] in ['SHORT', 'CLOSE_LONG']:
+            order_side = 'SELL'
+        else:
+            order_side = 'HOLD'
+
+        # ✅ ดำเนินการเทรดผ่าน Environment
+        profit = await self.env.execute_trade_async(
+            strategy['symbol'],
+            order_side,
+            strategy['size'],
+            strategy['leverage'],
+            strategy['stop_loss'],
+            strategy['take_profit'],
+            strategy['trailing_stop'],
+            strategy['trailing_take_profit'],
+        )
+
+        # ✅ อัปเดตสถิติการเทรดใน RiskGuardian
+        self.risk_guardian.total_trades += 1
+        if profit < 0:
+            self.risk_guardian.failed_trades += 1
+
+        return profit
