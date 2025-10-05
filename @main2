@@ -7,6 +7,25 @@ import asyncio, logging, traceback
 import numpy as np
 import pandas as pd
 import torch
+import time
+
+# ==============================
+# 🟢 ฟังก์ชันตรวจสอบสถานะระบบแบบเรียลไทม์
+# ==============================
+async def status_monitor_loop(ws_manager, api_manager, interval=10):
+    while True:
+        try:
+            ws_ok = "✅" if ws_manager.is_running() else "❌"
+            api_ok = "✅" if api_manager and getattr(api_manager, "exchange", None) else "❌"
+            delay = round(time.time() - ws_manager.last_data_time, 1)
+            symbol_count = len(ws_manager.data)
+            balance = getattr(ws_manager, "balance_data", {}).get("free", 0.0)
+            logging.info(
+                f"⏳ STATUS | WebSocket={ws_ok} | API={api_ok} | Symbols={symbol_count} | Delay={delay}s | Balance={balance:.2f} USDT"
+            )
+        except Exception as e:
+            logging.warning(f"⚠️ สถานะระบบไม่สมบูรณ์: {e}")
+        await asyncio.sleep(interval)
 
 # ==============================
 # ฟังก์ชันหลักของระบบเทรด
@@ -21,7 +40,7 @@ async def main():
     risk_guardian = RiskGuardian()
 
     # 🔹 เชื่อม WebSocketManager และ Exchange เข้ากับ Environment
-    env = MultiMarketEnv(ws_manager=ws_manager, exchange=api_manager.exchange)  # ✅ เพิ่มเพื่อซิงค์ข้อมูลเรียลไทม์
+    env = MultiMarketEnv(ws_manager=ws_manager, exchange=api_manager.exchange)
     env.trader = trader
 
     trader.replay_buffer = ReplayBuffer()
@@ -44,6 +63,7 @@ async def main():
 
     # ---------- งาน background ----------
     asyncio.create_task(resource_manager.monitor_resources())
+    asyncio.create_task(status_monitor_loop(ws_manager, api_manager))  # ✅ เพิ่ม Live Status Monitor
 
     # ---------- โหลดข้อมูลย้อนหลัง ----------
     for symbol in env.symbols:
@@ -66,12 +86,10 @@ async def main():
     # ==================================================
     while GlobalConfig.get('system_running'):
         try:
-            # 🔸 บันทึก Checkpoint
             if step_count % GlobalConfig.get('checkpoint_interval') == 0:
                 torch.save(trader.qnt.state_dict(), 'qnt_checkpoint.pth')
                 logging.info(f"บันทึก checkpoint ที่ step {step_count}")
 
-            # 🔸 อัปเดตเหรียญเทรด
             top_symbols = trader.select_top_coins(ws_manager.all_usdt_pairs, ws_manager.data, kpi_tracker)
             if set(top_symbols) != set(env.symbols):
                 env.symbols = top_symbols
@@ -79,36 +97,26 @@ async def main():
                 trader.madrl.update_symbols(top_symbols)
                 await ws_manager.update_symbols(top_symbols)
 
-            # 🔸 ทำ 1 step ของ environment
             observation, rewards, done, info = await env.step()
 
-            # 🔸 อัปเดต KPI และกำหนดทุนต่อรอบ
             total_profit = info.get('profit', 0.0)
             await kpi_tracker.update(total_profit)
             kpi_factor = kpi_optimizer.optimize(kpi_tracker.daily_profit)
             env.reinvest_cap = env.initial_balance * kpi_factor
 
-            # 🔸 อัปเดต risk
             await risk_guardian.update_dynamic_risk(ws_manager.data)
             risk_weights = await risk_allocator.allocate_risk(env.symbols, ws_manager.data, kpi_factor)
 
-            # 🔸 ประมวลผลกลยุทธ์รายเหรียญ
             for i, symbol in enumerate(env.symbols):
                 state = observation[i]
-
-                # คำนวณ volatility
                 last_close = ws_manager.data.get(symbol, {}).get('close', None)
                 series = [last_close] if last_close is not None else [0.0]
                 volatility = float(np.std(series)) or 0.01
 
-                # กลยุทธ์
                 strategy = await strategy_gen.generate_strategy(state.reshape(1, -1), symbol, volatility)
                 strategy['size'] *= risk_weights.get(symbol, GlobalConfig.get('risk_per_trade'))
-
-                # ดำเนินการเทรด
                 profit = await strategy_gen.execute_strategy(strategy)
 
-                # ========== 🧠 LOG ACTION ==========
                 action_type = strategy.get('action', 'HOLD').upper()
                 side = strategy.get('side', 'NEUTRAL').upper()
                 position_size = strategy.get('size', 0)
@@ -123,7 +131,6 @@ async def main():
                 else:
                     logging.info(f"🟡 [{symbol}] Action={action_type}")
 
-                # บันทึกสถานะ
                 trader.positions[symbol] = {
                     'side': side,
                     'size': position_size,
@@ -131,34 +138,22 @@ async def main():
                     'timestamp': asyncio.get_event_loop().time(),
                 }
 
-                # multi timeframe data
                 multi_tf_data = {
                     tf: env.multi_tf_data[tf].get(symbol, pd.DataFrame()).to_dict()
                     for tf in GlobalConfig.get('multi_tf_list', [])
                 }
 
-                # พยากรณ์
                 pred_discrete, pred_cont = trader.predict(state.reshape(1, -1))
                 action_idx = int(np.argmax(pred_discrete[0]))
                 cont_vec = pred_cont[0]
 
-                # บันทึก replay
                 trader.replay_buffer.add(
-                    state,
-                    action_idx,
-                    cont_vec,
-                    profit,
-                    observation[i],
-                    None,
-                    None,
-                    volatility,
-                    multi_tf_data,
+                    state, action_idx, cont_vec, profit,
+                    observation[i], None, None, volatility, multi_tf_data
                 )
 
-                # ฝึกโมเดลแบบออนไลน์
                 await trader.evolve(state.reshape(1, -1), profit, volatility)
 
-            # 🔸 สรุปสถานะ
             if step_count % 1 == 0:
                 active_positions = {s: trader.positions[s]['side'] for s in trader.positions if trader.positions[s]['size'] > 0}
                 if active_positions:
@@ -166,7 +161,6 @@ async def main():
                 else:
                     logging.info("📊 ไม่มีสถานะเปิดอยู่ในขณะนี้ (Flat)")
 
-            # 🔸 ฝึก Reinforcement Learning
             if step_count % GlobalConfig.get('rl_train_interval') == 0 and getattr(trader.replay_buffer, "buffer", None):
                 batch = trader.replay_buffer.sample(32)
                 if batch:
@@ -174,7 +168,6 @@ async def main():
                     await trader.train(states, discrete_actions, continuous_actions, rewards, next_states)
                     await trader.adversarial_train(states)
 
-            # 🔸 ปรับโมเดลด้วย Bayesian Optimization
             if step_count % GlobalConfig.get('auto_ml_interval') == 0:
                 trader.bayes_opt.maximize(init_points=2, n_iter=GlobalConfig.get('bayes_opt_steps'))
                 trader.model_weights = trader.bayes_opt.max['params']
@@ -192,7 +185,6 @@ async def main():
             await risk_guardian.emergency_stop()
             break
 
-    # 🔚 ยกเลิก control loop เมื่อหยุดระบบ
     control_task.cancel()
 
 
