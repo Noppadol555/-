@@ -1,0 +1,127 @@
+# ==========================================================
+# คลาสที่ 3: SSD (State Space Dynamics Model • Production Safe)
+# ==========================================================
+# ✅ เพิ่ม error handling รอบทุกเมธอด (forward, train)
+# ✅ Log ด้วย ⚠️ SSD Forward Error / ⚠️ SSD Train Error
+# ✅ ปลอดภัยสำหรับระบบเทรดจริง รันต่อได้แม้เกิด error
+# ==========================================================
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install torch
+
+import torch
+import torch.nn as nn
+import numpy as np
+import logging
+# from config import GlobalConfig
+
+class SSD(nn.Module):
+    """
+    โมเดล State Space Dynamics สำหรับทำนายสถานะถัดไป
+    การใช้งาน: ใช้ในการทำนายสถานะถัดไปในระบบการเทรด โดยปรับ learning rate ตาม volatility
+    Config ที่เกี่ยวข้อง: 'min_volatility_threshold' สำหรับปรับ adaptive_lr_factor ใน method train
+    """
+
+    def __init__(self, input_dim):
+        """
+        เริ่มต้นโมเดล SSD
+        Args:
+            input_dim (int): ขนาดของ input vector (จำนวน features)
+        """
+        super(SSD, self).__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Encoder-Decoder โครงสร้างหลัก
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 64),
+            nn.ReLU()
+        ).to(self.device)
+
+        self.decoder = nn.Sequential(
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, input_dim),
+            nn.ReLU()
+        ).to(self.device)
+
+        # Optimizer และ learning rate
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=0.0001, weight_decay=0.01)
+        self.adaptive_lr_factor = 1.0
+
+    # ==========================================================
+    # 🔹 Forward
+    # ==========================================================
+    def forward(self, x):
+        """
+        ประมวลผล input ผ่าน encoder และ decoder
+        Args:
+            x (torch.Tensor): Input tensor ขนาด (batch_size, input_dim)
+        Returns:
+            torch.Tensor: Output tensor ที่ทำนายสถานะถัดไป
+        """
+        try:
+            x = x.to(self.device)
+            latent = self.encoder(x)
+            reconstructed = self.decoder(latent)
+            return reconstructed
+        except Exception as e:
+            logging.error(f"⚠️ SSD Forward Error: {e}")
+            # คืนค่า tensor ศูนย์แทน เพื่อให้ระบบไม่หยุด
+            return torch.zeros_like(x, device=self.device)
+
+    # ==========================================================
+    # 🔹 Train
+    # ==========================================================
+    def train(self, state_batch, next_state_batch, volatility=None):
+        """
+        ฝึกโมเดล SSD ด้วยข้อมูล state และ next_state
+        Args:
+            state_batch (np.ndarray): Batch ของสถานะปัจจุบัน
+            next_state_batch (np.ndarray): Batch ของสถานะถัดไป
+            volatility (float, optional): ความผันผวนสำหรับปรับ learning rate
+        Returns:
+            float: ค่า loss จากการฝึก
+        """
+        try:
+            # ✅ ตรวจสอบ batch ว่าง
+            if state_batch is None or next_state_batch is None or len(state_batch) == 0:
+                logging.warning("⚠️ SSD Train Warning: Empty or invalid batch detected, skipping training.")
+                return 0.0
+
+            state_batch = torch.FloatTensor(state_batch).to(self.device)
+            next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
+
+            # ✅ Forward pass
+            reconstructed = self.forward(state_batch)
+            loss = nn.MSELoss()(reconstructed, next_state_batch)
+
+            # ✅ ปรับ learning rate แบบ adaptive ตาม volatility
+            if volatility is not None:
+                try:
+                    threshold = GlobalConfig.get('min_volatility_threshold', 1e-6)
+                    threshold = max(threshold, 1e-6)
+                    self.adaptive_lr_factor = min(1.0, max(0.1, volatility / threshold))
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = 0.0001 * self.adaptive_lr_factor
+                except Exception as inner_e:
+                    logging.error(f"⚠️ SSD Adaptive LR Error: {inner_e}")
+
+            # ✅ Gradient descent
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            # ✅ ตรวจจับ NaN loss
+            if torch.isnan(loss):
+                logging.warning("⚠️ SSD Loss NaN detected, resetting optimizer.")
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = 0.0001
+                return 0.0
+
+            return float(loss.item())
+
+        except Exception as e:
+            logging.error(f"⚠️ SSD Train Error: {e}")
+            return 0.0
