@@ -303,3 +303,36 @@ class MultiMarketEnv(gym.Env):
         self.current_step = 0
         if self.dry_run:
             self.simulator.reset()
+    # ==========================================================
+    # ระบบส่งคำสั่งกลับให้ main / APIManager (Trade Dispatcher)
+    # ==========================================================
+    def queue_trade_action(self, strategy: dict):
+        """
+        บันทึกคำสั่งเทรดที่ได้รับจาก StrategyGenerator
+        เพื่อส่งให้ main หรือ APIManager ภายหลัง
+        """
+        if not hasattr(self, "_trade_queue"):
+            self._trade_queue = []
+        self._trade_queue.append({
+            "timestamp": time.time(),
+            "symbol": strategy.get("symbol"),
+            "action": strategy.get("action"),
+            "side": strategy.get("side"),
+            "size": strategy.get("size"),
+            "leverage": strategy.get("leverage"),
+            "stop_loss": strategy.get("stop_loss"),
+            "take_profit": strategy.get("take_profit"),
+            "trailing_stop": strategy.get("trailing_stop"),
+            "trailing_take_profit": strategy.get("trailing_take_profit"),
+        })
+
+    def pop_trade_actions(self):
+        """
+        main จะเรียกใช้เพื่อดึงรายการคำสั่งที่ StrategyGenerator คำนวณเสร็จ
+        (พร้อมส่งต่อ APIManager เพื่อเทรดจริง)
+        """
+        if not hasattr(self, "_trade_queue") or not self._trade_queue:
+            return []
+        actions = self._trade_queue.copy()
+        self._trade_queue.clear()
+        return actions
