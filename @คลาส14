@@ -89,6 +89,9 @@ class MultiMarketEnv(gym.Env):
         self.data, self.raw_data, self.scalers = {}, {}, {}
         self.trader = None
 
+        # ✅ สร้าง trade_queue ตั้งแต่ต้นเพื่อป้องกัน KeyError
+        self._trade_queue = []
+
         # SQLite + Excel
         self.trade_log_file = GlobalConfig.get('trade_log_file')
         self.db_conn = sqlite3.connect('env_history.db', timeout=10)
@@ -200,7 +203,7 @@ class MultiMarketEnv(gym.Env):
                 'trailing_tp': trailing_take_profit
             }
             self.available_balance -= entry_cost
-            return 0.0
+            return {"status": "ORDER_PLACED", "symbol": symbol, "side": "LONG"}
 
         # เปิด SHORT
         if action == "SHORT":
@@ -216,7 +219,7 @@ class MultiMarketEnv(gym.Env):
                 'trailing_tp': trailing_take_profit
             }
             self.available_balance -= entry_cost
-            return 0.0
+            return {"status": "ORDER_PLACED", "symbol": symbol, "side": "SHORT"}
 
         # ปิด LONG
         if action == "CLOSE_LONG" and pos and pos['side'] == 'LONG':
@@ -303,6 +306,7 @@ class MultiMarketEnv(gym.Env):
         self.current_step = 0
         if self.dry_run:
             self.simulator.reset()
+
     # ==========================================================
     # ระบบส่งคำสั่งกลับให้ main / APIManager (Trade Dispatcher)
     # ==========================================================
@@ -311,8 +315,12 @@ class MultiMarketEnv(gym.Env):
         บันทึกคำสั่งเทรดที่ได้รับจาก StrategyGenerator
         เพื่อส่งให้ main หรือ APIManager ภายหลัง
         """
-        if not hasattr(self, "_trade_queue"):
-            self._trade_queue = []
+        # ✅ ป้องกันคำสั่งซ้ำภายในรอบเดียวกัน
+        if hasattr(self, "_trade_queue") and self._trade_queue:
+            last = self._trade_queue[-1]
+            if last["symbol"] == strategy.get("symbol") and last["action"] == strategy.get("action"):
+                return  # 🔁 ข้ามคำสั่งซ้ำในรอบเดียวกัน
+
         self._trade_queue.append({
             "timestamp": time.time(),
             "symbol": strategy.get("symbol"),
@@ -336,3 +344,8 @@ class MultiMarketEnv(gym.Env):
         actions = self._trade_queue.copy()
         self._trade_queue.clear()
         return actions
+
+    def flush_queue(self):
+        """ล้างคำสั่งใน queue ทั้งหมด (ใช้ตอนรีเซ็ตระบบกลางคัน)"""
+        if hasattr(self, "_trade_queue"):
+            self._trade_queue.clear()
