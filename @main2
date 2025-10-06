@@ -49,7 +49,6 @@ async def auto_update_trailing(strategy, current_price):
         # ✅ สำหรับฝั่ง LONG
         if action in ["LONG", "BUY"]:
             if current_price > entry * (1 + trailing_callback):
-                # ขยับ SL และ TP ตาม callback rate
                 new_sl = max(stop_loss, current_price * (1 - trailing_callback))
                 new_tp = max(take_profit, current_price * (1 + trailing_callback))
                 strategy["stop_loss"], strategy["take_profit"] = new_sl, new_tp
@@ -160,7 +159,15 @@ async def main():
                 if last_close is not None:
                     strategy = await auto_update_trailing(strategy, last_close)
 
-                profit = await strategy_gen.execute_strategy(strategy)
+                # ✅ ส่งกลยุทธ์เข้าคิวให้ main ใช้ในโหมดเทรดจริง
+                if hasattr(env, "queue_trade_action"):
+                    env.queue_trade_action(strategy)
+
+                # ✅ โหมดจำลองให้ทำคำสั่งภายใน env เหมือนเดิม
+                if GlobalConfig.get('dry_run'):
+                    profit = await strategy_gen.execute_strategy(strategy)
+                else:
+                    profit = 0.0  # เทรดจริงจะไปส่งคำสั่งจริงช่วงท้าย loop
 
                 action_type = strategy.get('action', 'HOLD').upper()
                 side = strategy.get('side', 'NEUTRAL').upper()
@@ -198,6 +205,70 @@ async def main():
                 )
 
                 await trader.evolve(state.reshape(1, -1), profit, volatility)
+
+            # ==================================================
+            # ✅ ส่งคำสั่งจริง (เฉพาะโหมดเทรดจริงเท่านั้น)
+            # ==================================================
+            if not GlobalConfig.get('dry_run') and hasattr(env, "pop_trade_actions"):
+                try:
+                    trade_actions = env.pop_trade_actions()
+                except Exception:
+                    trade_actions = []
+
+                for act in trade_actions:
+                    try:
+                        symbol = act.get('symbol')
+                        action = (act.get('action') or '').upper()
+                        size = float(act.get('size') or 0.0)
+                        leverage = int(float(act.get('leverage') or GlobalConfig.get('min_leverage', 1)))
+
+                        # ราคาอ้างอิงปัจจุบันจาก WS
+                        current_price = 0.0
+                        if hasattr(ws_manager, "get_latest_price"):
+                            try:
+                                current_price = float(ws_manager.get_latest_price(symbol) or 0.0)
+                            except Exception:
+                                current_price = 0.0
+
+                        if current_price <= 0:
+                            logging.warning(f"ข้ามคำสั่งจริง {symbol}: ไม่มีราคาปัจจุบัน")
+                            continue
+
+                        # ตั้ง margin mode / leverage
+                        await api_manager.set_margin_mode(symbol)
+                        await api_manager.set_leverage(symbol, leverage)
+
+                        # แมปฝั่งคำสั่ง
+                        if action in ['LONG', 'CLOSE_SHORT']:
+                            order_side = 'buy'
+                        elif action in ['SHORT', 'CLOSE_LONG']:
+                            order_side = 'sell'
+                        else:
+                            order_side = None
+
+                        # เปิดสถานะ → ใช้ limit+trailing (callback จาก CONFIG)
+                        if action in ['LONG', 'SHORT'] and order_side:
+                            callback = GlobalConfig.get('trailing_callback_rate', 0.5)
+                            await api_manager.create_limit_order_with_trailing(
+                                symbol,
+                                order_side,
+                                size,
+                                current_price,
+                                callback_rate=callback
+                            )
+
+                        # ปิดสถานะ → ใช้ STOP_MARKET reduceOnly ทันที (trigger ที่ current_price)
+                        elif action in ['CLOSE_LONG', 'CLOSE_SHORT'] and order_side:
+                            await api_manager.create_stop_order(
+                                symbol,
+                                order_side,
+                                size,
+                                stop_price=current_price,
+                                params={'reduceOnly': True}
+                            )
+
+                    except Exception as e:
+                        logging.error(f"❌ ส่งคำสั่งจริงล้มเหลว: {e}")
 
             if step_count % 1 == 0:
                 active_positions = {s: trader.positions[s]['side'] for s in trader.positions if trader.positions[s]['size'] > 0}
