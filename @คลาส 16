@@ -150,8 +150,9 @@ class StrategyGenerator:
                     updated = True
 
         if updated:
+            # ✅ ป้องกัน KeyError กรณี symbol ไม่มีใน dict
             logging.debug(
-                f"🔄 อัปเดต Trailing SL {strategy['symbol']} → {strategy['stop_loss']:.4f}"
+                f"🔄 อัปเดต Trailing SL {strategy.get('symbol', '?')} → {strategy.get('stop_loss', 0):.4f}"
             )
 
         return strategy
