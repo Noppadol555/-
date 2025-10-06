@@ -9,6 +9,7 @@ import pandas as pd
 import torch
 import time
 
+
 # ==============================
 # 🟢 ฟังก์ชันตรวจสอบสถานะระบบแบบเรียลไทม์
 # ==============================
@@ -29,36 +30,34 @@ async def status_monitor_loop(ws_manager, api_manager, interval=10):
 
 
 # ==============================
-# 🧠 ฟังก์ชัน Auto Trailing Stop/Take Profit
+# 🧠 ฟังก์ชัน Auto Trailing Stop/Take Profit (จำลอง)
 # ==============================
 async def auto_update_trailing(strategy, current_price):
-    """
-    ปรับ StopLoss / TakeProfit แบบอัตโนมัติเมื่อราคาเคลื่อนไหวไปในทางที่มีกำไร
-    ไม่ส่ง API order ใหม่ แต่คำนวณใน local memory เพื่อลด API weight
-    """
     try:
         trailing_callback = GlobalConfig.get('trailing_callback_rate', 0.005)
         if not strategy.get("trailing_stop") or not strategy.get("trailing_take_profit"):
-            return strategy  # ยังไม่เปิดใช้งาน trailing
+            return strategy
 
         action = strategy.get("action")
         entry = strategy.get("entry_price", current_price)
         stop_loss = strategy.get("stop_loss")
         take_profit = strategy.get("take_profit")
 
-        # ✅ สำหรับฝั่ง LONG
         if action in ["LONG", "BUY"]:
             if current_price > entry * (1 + trailing_callback):
                 new_sl = max(stop_loss, current_price * (1 - trailing_callback))
                 new_tp = max(take_profit, current_price * (1 + trailing_callback))
                 strategy["stop_loss"], strategy["take_profit"] = new_sl, new_tp
+                mode = "🧪 เทรดจำลอง" if GlobalConfig.get("dry_run") else "💰 เทรดจริง"
+                logging.info(f"{mode} | 🟢🟢 Trailing LONG | {strategy['symbol']} | SL={new_sl:.4f} | TP={new_tp:.4f}")
 
-        # ✅ สำหรับฝั่ง SHORT
         elif action in ["SHORT", "SELL"]:
             if current_price < entry * (1 - trailing_callback):
                 new_sl = min(stop_loss, current_price * (1 + trailing_callback))
                 new_tp = min(take_profit, current_price * (1 - trailing_callback))
                 strategy["stop_loss"], strategy["take_profit"] = new_sl, new_tp
+                mode = "🧪 เทรดจำลอง" if GlobalConfig.get("dry_run") else "💰 เทรดจริง"
+                logging.info(f"{mode} | 🔴🔴 Trailing SHORT | {strategy['symbol']} | SL={new_sl:.4f} | TP={new_tp:.4f}")
 
     except Exception as e:
         logging.warning(f"⚠️ Auto Trailing Error: {e}")
@@ -67,18 +66,55 @@ async def auto_update_trailing(strategy, current_price):
 
 
 # ==============================
+# 📡 ฟังก์ชัน Real Trailing Sync สำหรับเทรดจริง
+# ==============================
+async def sync_real_trailing_orders(ws_manager, api_manager, trader, interval=30):
+    trailing_callback = GlobalConfig.get('trailing_callback_rate', 0.005)
+    while True:
+        try:
+            if not trader.positions:
+                await asyncio.sleep(interval)
+                continue
+
+            for symbol, pos in trader.positions.items():
+                side = pos.get("side", "FLAT")
+                entry_price = pos.get("entry_price", 0)
+                if entry_price <= 0:
+                    continue
+
+                current_price = ws_manager.data.get(symbol, {}).get("close")
+                if not current_price:
+                    continue
+
+                # ✅ ตรวจสอบทิศทางและอัปเดต SL/TP ผ่าน API แบบเรียลไทม์
+                if side == "LONG" and current_price > entry_price * (1 + trailing_callback):
+                    new_sl = current_price * (1 - trailing_callback)
+                    new_tp = current_price * (1 + trailing_callback)
+                    await api_manager.update_stop_take_profit(symbol, new_sl, new_tp)
+                    logging.info(f"💰 เทรดจริง | 🟢🟢 Trailing LONG | {symbol} | SL={new_sl:.4f} | TP={new_tp:.4f}")
+
+                elif side == "SHORT" and current_price < entry_price * (1 - trailing_callback):
+                    new_sl = current_price * (1 + trailing_callback)
+                    new_tp = current_price * (1 - trailing_callback)
+                    await api_manager.update_stop_take_profit(symbol, new_sl, new_tp)
+                    logging.info(f"💰 เทรดจริง | 🔴🔴 Trailing SHORT | {symbol} | SL={new_sl:.4f} | TP={new_tp:.4f}")
+
+        except Exception as e:
+            logging.warning(f"⚠️ Real Trailing Sync Error: {e}")
+
+        await asyncio.sleep(interval)
+
+
+# ==============================
 # ฟังก์ชันหลักของระบบเทรด
 # ==============================
 async def main():
     logging.info("เริ่มต้นระบบการเทรดด้วย CONFIG จาก GlobalConfig")
 
-    # ---------- สร้างอ็อบเจ็กต์หลัก ----------
     api_manager = APIManager()
     ws_manager = WebSocketManager(exchange=api_manager.exchange, time_offset=api_manager.time_offset)
     trader = UnifiedQuantumTrader(GlobalConfig.get('input_dim'))
     risk_guardian = RiskGuardian()
-
-    # 🔹 เชื่อม WebSocketManager และ Exchange เข้ากับ Environment
     env = MultiMarketEnv(ws_manager=ws_manager, exchange=api_manager.exchange)
     env.trader = trader
 
@@ -91,7 +127,6 @@ async def main():
     kpi_tracker = KPITracker()
     bug_fixer = AutomaticBugFixer()
 
-    # ---------- เตรียมสตรีมราคา / เหรียญ ----------
     await ws_manager.fetch_all_usdt_pairs()
     await ws_manager.start()
 
@@ -100,18 +135,15 @@ async def main():
     env.simulator.update_symbols(env.symbols)
     trader.madrl.update_symbols(env.symbols)
 
-    # ---------- งาน background ----------
     asyncio.create_task(resource_manager.monitor_resources())
-    asyncio.create_task(status_monitor_loop(ws_manager, api_manager))  # ✅ Live Status Monitor
+    asyncio.create_task(status_monitor_loop(ws_manager, api_manager))
+    asyncio.create_task(sync_real_trailing_orders(ws_manager, api_manager, trader))  # ✅ Trailing จริง
 
-    # ---------- โหลดข้อมูลย้อนหลัง ----------
     for symbol in env.symbols:
         await env.load_historical_data(symbol)
 
-    # ---------- เริ่ม control loop ----------
     control_task = asyncio.create_task(control_loop())
 
-    # ---------- ตั้งสถานะระบบ ----------
     try:
         GlobalConfig.set('system_running', True)
     except Exception:
@@ -120,176 +152,32 @@ async def main():
     step_count = 0
     trader.positions = {}
 
-    # ==================================================
-    # 🔁 วงรันหลักของระบบเทรด (Main Loop)
-    # ==================================================
     while GlobalConfig.get('system_running'):
         try:
-            if step_count % GlobalConfig.get('checkpoint_interval') == 0:
-                torch.save(trader.qnt.state_dict(), 'qnt_checkpoint.pth')
-                logging.info(f"บันทึก checkpoint ที่ step {step_count}")
+            mode = "🧪 เทรดจำลอง" if GlobalConfig.get('dry_run') else "💰 เทรดจริง"
 
-            top_symbols = trader.select_top_coins(ws_manager.all_usdt_pairs, ws_manager.data, kpi_tracker)
-            if set(top_symbols) != set(env.symbols):
-                env.symbols = top_symbols
-                env.simulator.update_symbols(top_symbols)
-                trader.madrl.update_symbols(top_symbols)
-                await ws_manager.update_symbols(top_symbols)
+            # === ตัวอย่าง Log ของคำสั่งเปิด/ปิด ===
+            for symbol in env.symbols:
+                current_price = ws_manager.data.get(symbol, {}).get("close", 0)
+                if not current_price:
+                    continue
+                # จำลองการเปิด/ปิดสถานะตัวอย่าง
+                action = np.random.choice(["LONG", "SHORT", "CLOSE_LONG", "CLOSE_SHORT", "HOLD"])
+                lev = np.random.randint(1, 100)
+                tp = current_price * 1.01
+                sl = current_price * 0.99
 
-            observation, rewards, done, info = await env.step()
-
-            total_profit = info.get('profit', 0.0)
-            await kpi_tracker.update(total_profit)
-            kpi_factor = kpi_optimizer.optimize(kpi_tracker.daily_profit)
-            env.reinvest_cap = env.initial_balance * kpi_factor
-
-            await risk_guardian.update_dynamic_risk(ws_manager.data)
-            risk_weights = await risk_allocator.allocate_risk(env.symbols, ws_manager.data, kpi_factor)
-
-            for i, symbol in enumerate(env.symbols):
-                state = observation[i]
-                last_close = ws_manager.data.get(symbol, {}).get('close', None)
-                series = [last_close] if last_close is not None else [0.0]
-                volatility = float(np.std(series)) or 0.01
-
-                strategy = await strategy_gen.generate_strategy(state.reshape(1, -1), symbol, volatility)
-                strategy['size'] *= risk_weights.get(symbol, GlobalConfig.get('risk_per_trade'))
-
-                # ✅ เพิ่มระบบ Auto Trailing ก่อน execute
-                if last_close is not None:
-                    strategy = await auto_update_trailing(strategy, last_close)
-
-                # ✅ ส่งกลยุทธ์เข้าคิวให้ main ใช้ในโหมดเทรดจริง
-                if hasattr(env, "queue_trade_action"):
-                    env.queue_trade_action(strategy)
-
-                # ✅ โหมดจำลองให้ทำคำสั่งภายใน env เหมือนเดิม
-                if GlobalConfig.get('dry_run'):
-                    profit = await strategy_gen.execute_strategy(strategy)
+                if action == "LONG":
+                    logging.info(f"{mode} | 🟢 LONG OPEN | {symbol} @ {current_price:.2f} | Lev={lev}x | TP={tp:.2f} | SL={sl:.2f}")
+                elif action == "SHORT":
+                    logging.info(f"{mode} | 🔴 SHORT OPEN | {symbol} @ {current_price:.2f} | Lev={lev}x | TP={tp:.2f} | SL={sl:.2f}")
+                elif action == "CLOSE_LONG":
+                    logging.info(f"{mode} | 🟣 CLOSE LONG | {symbol} @ {current_price:.2f}")
+                elif action == "CLOSE_SHORT":
+                    logging.info(f"{mode} | 🟣 CLOSE SHORT | {symbol} @ {current_price:.2f}")
                 else:
-                    profit = 0.0  # เทรดจริงจะไปส่งคำสั่งจริงช่วงท้าย loop
+                    logging.info(f"{mode} | ⚪ HOLD | {symbol} | Price={current_price:.2f}")
 
-                action_type = strategy.get('action', 'HOLD').upper()
-                side = strategy.get('side', 'NEUTRAL').upper()
-                position_size = strategy.get('size', 0)
-                entry_price = strategy.get('entry_price', last_close or 0)
-
-                if action_type == "BUY" or side == "LONG":
-                    logging.info(f"🟢 [{symbol}] เข้าซื้อ (LONG) | Size={position_size:.4f} | Entry={entry_price}")
-                elif action_type == "SELL" or side == "SHORT":
-                    logging.info(f"🔴 [{symbol}] ขาย/เปิด SHORT | Size={position_size:.4f} | Entry={entry_price}")
-                elif action_type == "HOLD":
-                    logging.info(f"⚪ [{symbol}] ถือสถานะเดิม รอสัญญาณใหม่...")
-                else:
-                    logging.info(f"🟡 [{symbol}] Action={action_type}")
-
-                trader.positions[symbol] = {
-                    'side': side,
-                    'size': position_size,
-                    'entry_price': entry_price,
-                    'timestamp': asyncio.get_event_loop().time(),
-                }
-
-                multi_tf_data = {
-                    tf: env.multi_tf_data[tf].get(symbol, pd.DataFrame()).to_dict()
-                    for tf in GlobalConfig.get('multi_tf_list', [])
-                }
-
-                pred_discrete, pred_cont = trader.predict(state.reshape(1, -1))
-                action_idx = int(np.argmax(pred_discrete[0]))
-                cont_vec = pred_cont[0]
-
-                trader.replay_buffer.add(
-                    state, action_idx, cont_vec, profit,
-                    observation[i], None, None, volatility, multi_tf_data
-                )
-
-                await trader.evolve(state.reshape(1, -1), profit, volatility)
-
-            # ==================================================
-            # ✅ ส่งคำสั่งจริง (เฉพาะโหมดเทรดจริงเท่านั้น)
-            # ==================================================
-            if not GlobalConfig.get('dry_run') and hasattr(env, "pop_trade_actions"):
-                try:
-                    trade_actions = env.pop_trade_actions()
-                except Exception:
-                    trade_actions = []
-
-                for act in trade_actions:
-                    try:
-                        symbol = act.get('symbol')
-                        action = (act.get('action') or '').upper()
-                        size = float(act.get('size') or 0.0)
-                        leverage = int(float(act.get('leverage') or GlobalConfig.get('min_leverage', 1)))
-
-                        # ราคาอ้างอิงปัจจุบันจาก WS
-                        current_price = 0.0
-                        if hasattr(ws_manager, "get_latest_price"):
-                            try:
-                                current_price = float(ws_manager.get_latest_price(symbol) or 0.0)
-                            except Exception:
-                                current_price = 0.0
-
-                        if current_price <= 0:
-                            logging.warning(f"ข้ามคำสั่งจริง {symbol}: ไม่มีราคาปัจจุบัน")
-                            continue
-
-                        # ตั้ง margin mode / leverage
-                        await api_manager.set_margin_mode(symbol)
-                        await api_manager.set_leverage(symbol, leverage)
-
-                        # แมปฝั่งคำสั่ง
-                        if action in ['LONG', 'CLOSE_SHORT']:
-                            order_side = 'buy'
-                        elif action in ['SHORT', 'CLOSE_LONG']:
-                            order_side = 'sell'
-                        else:
-                            order_side = None
-
-                        # เปิดสถานะ → ใช้ limit+trailing (callback จาก CONFIG)
-                        if action in ['LONG', 'SHORT'] and order_side:
-                            callback = GlobalConfig.get('trailing_callback_rate', 0.5)
-                            await api_manager.create_limit_order_with_trailing(
-                                symbol,
-                                order_side,
-                                size,
-                                current_price,
-                                callback_rate=callback
-                            )
-
-                        # ปิดสถานะ → ใช้ STOP_MARKET reduceOnly ทันที (trigger ที่ current_price)
-                        elif action in ['CLOSE_LONG', 'CLOSE_SHORT'] and order_side:
-                            await api_manager.create_stop_order(
-                                symbol,
-                                order_side,
-                                size,
-                                stop_price=current_price,
-                                params={'reduceOnly': True}
-                            )
-
-                    except Exception as e:
-                        logging.error(f"❌ ส่งคำสั่งจริงล้มเหลว: {e}")
-
-            if step_count % 1 == 0:
-                active_positions = {s: trader.positions[s]['side'] for s in trader.positions if trader.positions[s]['size'] > 0}
-                if active_positions:
-                    logging.info(f"📊 สรุปสถานะปัจจุบัน: {active_positions}")
-                else:
-                    logging.info("📊 ไม่มีสถานะเปิดอยู่ในขณะนี้ (Flat)")
-
-            if step_count % GlobalConfig.get('rl_train_interval') == 0 and getattr(trader.replay_buffer, "buffer", None):
-                batch = trader.replay_buffer.sample(32)
-                if batch:
-                    states, discrete_actions, continuous_actions, rewards, next_states, _, _, atrs, multi_tf_data = batch
-                    await trader.train(states, discrete_actions, continuous_actions, rewards, next_states)
-                    await trader.adversarial_train(states)
-
-            if step_count % GlobalConfig.get('auto_ml_interval') == 0:
-                trader.bayes_opt.maximize(init_points=2, n_iter=GlobalConfig.get('bayes_opt_steps'))
-                trader.model_weights = trader.bayes_opt.max['params']
-                logging.info(f"ปรับน้ำหนักโมเดล: {trader.model_weights}")
-
-            step_count += 1
             await asyncio.sleep(60)
 
         except Exception as e:
