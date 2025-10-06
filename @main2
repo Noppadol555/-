@@ -27,6 +27,46 @@ async def status_monitor_loop(ws_manager, api_manager, interval=10):
             logging.warning(f"⚠️ สถานะระบบไม่สมบูรณ์: {e}")
         await asyncio.sleep(interval)
 
+
+# ==============================
+# 🧠 ฟังก์ชัน Auto Trailing Stop/Take Profit
+# ==============================
+async def auto_update_trailing(strategy, current_price):
+    """
+    ปรับ StopLoss / TakeProfit แบบอัตโนมัติเมื่อราคาเคลื่อนไหวไปในทางที่มีกำไร
+    ไม่ส่ง API order ใหม่ แต่คำนวณใน local memory เพื่อลด API weight
+    """
+    try:
+        trailing_callback = GlobalConfig.get('trailing_callback_rate', 0.005)
+        if not strategy.get("trailing_stop") or not strategy.get("trailing_take_profit"):
+            return strategy  # ยังไม่เปิดใช้งาน trailing
+
+        action = strategy.get("action")
+        entry = strategy.get("entry_price", current_price)
+        stop_loss = strategy.get("stop_loss")
+        take_profit = strategy.get("take_profit")
+
+        # ✅ สำหรับฝั่ง LONG
+        if action in ["LONG", "BUY"]:
+            if current_price > entry * (1 + trailing_callback):
+                # ขยับ SL และ TP ตาม callback rate
+                new_sl = max(stop_loss, current_price * (1 - trailing_callback))
+                new_tp = max(take_profit, current_price * (1 + trailing_callback))
+                strategy["stop_loss"], strategy["take_profit"] = new_sl, new_tp
+
+        # ✅ สำหรับฝั่ง SHORT
+        elif action in ["SHORT", "SELL"]:
+            if current_price < entry * (1 - trailing_callback):
+                new_sl = min(stop_loss, current_price * (1 + trailing_callback))
+                new_tp = min(take_profit, current_price * (1 - trailing_callback))
+                strategy["stop_loss"], strategy["take_profit"] = new_sl, new_tp
+
+    except Exception as e:
+        logging.warning(f"⚠️ Auto Trailing Error: {e}")
+
+    return strategy
+
+
 # ==============================
 # ฟังก์ชันหลักของระบบเทรด
 # ==============================
@@ -63,7 +103,7 @@ async def main():
 
     # ---------- งาน background ----------
     asyncio.create_task(resource_manager.monitor_resources())
-    asyncio.create_task(status_monitor_loop(ws_manager, api_manager))  # ✅ เพิ่ม Live Status Monitor
+    asyncio.create_task(status_monitor_loop(ws_manager, api_manager))  # ✅ Live Status Monitor
 
     # ---------- โหลดข้อมูลย้อนหลัง ----------
     for symbol in env.symbols:
@@ -115,12 +155,17 @@ async def main():
 
                 strategy = await strategy_gen.generate_strategy(state.reshape(1, -1), symbol, volatility)
                 strategy['size'] *= risk_weights.get(symbol, GlobalConfig.get('risk_per_trade'))
+
+                # ✅ เพิ่มระบบ Auto Trailing ก่อน execute
+                if last_close is not None:
+                    strategy = await auto_update_trailing(strategy, last_close)
+
                 profit = await strategy_gen.execute_strategy(strategy)
 
                 action_type = strategy.get('action', 'HOLD').upper()
                 side = strategy.get('side', 'NEUTRAL').upper()
                 position_size = strategy.get('size', 0)
-                entry_price = strategy.get('entry_price', 0)
+                entry_price = strategy.get('entry_price', last_close or 0)
 
                 if action_type == "BUY" or side == "LONG":
                     logging.info(f"🟢 [{symbol}] เข้าซื้อ (LONG) | Size={position_size:.4f} | Entry={entry_price}")
