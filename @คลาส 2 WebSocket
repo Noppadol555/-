@@ -53,7 +53,11 @@ class WebSocketManager:
         self.balance_data = {"free": 0.0, "locked": 0.0}
 
         # --------- SQLite ---------
-        self.db_conn = sqlite3.connect(GlobalConfig.get("db_path", "market.db"), timeout=10)
+        self.db_conn = sqlite3.connect(
+            GlobalConfig.get("db_path", "market.db"),
+            timeout=10,
+            check_same_thread=False  # ✅ ป้องกัน sqlite lock ข้าม thread
+        )
         self._init_db()
 
     # --------------------------- DB ---------------------------
@@ -70,6 +74,13 @@ class WebSocketManager:
             )"""
         )
         self.db_conn.commit()
+
+    async def _commit_safe(self):
+        """✅ commit แบบไม่บล็อค event loop"""
+        try:
+            await asyncio.to_thread(self.db_conn.commit)
+        except Exception as e:
+            logging.error(f"Commit failed: {e}")
 
     # ---------------------- Fetch all USDT pairs ----------------------
     async def fetch_all_usdt_pairs(self):
@@ -102,17 +113,15 @@ class WebSocketManager:
             "depth": d.get("depth", {}),
         }
 
-    # 🟢 เพิ่มใหม่: คืนค่าราคาล่าสุด
+    # 🟢 คืนค่าราคาล่าสุด
     def get_latest_price(self, symbol: str) -> float:
-        """คืนค่าราคาล่าสุดของเหรียญ (ใช้ใน MultiMarketEnv หรือ main loop)"""
         try:
             return float(self.data.get(symbol, {}).get("close", 0.0))
         except Exception:
             return 0.0
 
-    # 🟢 เพิ่มใหม่: คืนค่ายอดเงินล่าสุด
+    # 🟢 คืนค่ายอดเงินล่าสุด
     def get_latest_balance(self) -> float:
-        """คืนค่ายอดเงินล่าสุด (เชื่อมกับ user stream)"""
         try:
             return float(self.balance_data.get("free", GlobalConfig.get("initial_balance", 100.0)))
         except Exception:
@@ -182,21 +191,16 @@ class WebSocketManager:
     # ---------------------- Main start ----------------------
     @retry(wait=wait_exponential(multiplier=1, min=3, max=60), stop=stop_after_attempt(10))
     async def start(self):
-        """เริ่มเชื่อมต่อโดยอัตโนมัติ (โหลดคู่ USDT ทั้งหมดก่อน)"""
         await self.fetch_all_usdt_pairs()
         if not self.all_usdt_pairs:
             logging.error("❌ ไม่พบคู่ USDT ใดๆ")
             return
 
-        # แบ่งเป็นชุดละ 1024 streams
         chunks = [self.all_usdt_pairs[i:i + 1024] for i in range(0, len(self.all_usdt_pairs), 1024)]
-
-        # เริ่มทุกชุดพร้อมกัน
         for idx, chunk in enumerate(chunks):
             asyncio.create_task(self._start_chunk(chunk, idx))
 
     async def _start_chunk(self, symbols: list[str], group_idx: int = 0):
-        """เชื่อมต่อ public stream สำหรับชุด symbol"""
         await self.update_symbols(symbols)
         self.running = True
         self.start_time = time.time()
@@ -222,7 +226,8 @@ class WebSocketManager:
                             data = json.loads(raw)
                             await self._handle_public_message(data)
                         except asyncio.TimeoutError:
-                            await ws.ping()
+                            pong_waiter = await ws.ping()  # ✅ ping จริง
+                            await pong_waiter
                             logging.debug(f"[{group_idx}] waiting data...")
             except Exception as e:
                 reconnects += 1
@@ -241,11 +246,9 @@ class WebSocketManager:
             price = float(msg.get("c", 0))
             vol = float(msg.get("v", 0))
             ts = time.time()
+            self.last_data_time = ts  # ✅ อัปเดตเวลาเมื่อได้รับข้อมูลจริง
 
-            # ✅ ดึง funding rate จาก REST API (แบบ async)
             funding_rate = await self._safe_fetch_funding_rate(symbol)
-
-            # รวมข้อมูลทั้งหมดแบบปลอดภัย
             self.data[symbol] = {
                 "timestamp": ts,
                 "close": price,
@@ -259,7 +262,9 @@ class WebSocketManager:
                 "INSERT INTO ws_data (symbol, timestamp, close, volume, funding_rate, depth) VALUES (?, ?, ?, ?, ?, ?)",
                 (symbol, ts, price, vol, funding_rate, 0),
             )
-            self.db_conn.commit()
+            # ✅ ใช้ commit แบบ async เพื่อไม่บล็อค event loop
+            await self._commit_safe()
+
             logging.info(f"📈 {symbol} = {price:.2f} | Vol={vol:.2f} | FR={funding_rate:.6f}")
         except Exception as e:
             logging.error(f"เกิดข้อผิดพลาดใน _handle_public_message: {e}")
