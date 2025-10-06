@@ -4,7 +4,7 @@
 # ใช้ GlobalConfig สำหรับค่าพารามิเตอร์ทั้งหมด
 # ===============================================
 
-# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งใน terminal ก่อนใช้งาน)
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้
 # pip install ccxt tenacity pandas
 
 import os
@@ -17,7 +17,7 @@ from typing import Optional, Dict, Any, List
 import ccxt.async_support as ccxt_async
 from tenacity import retry, wait_exponential, stop_after_attempt
 import pandas as pd
-from config import GlobalConfig  # ✅ ให้ซิงค์กับ GlobalConfig ของเจ้านายที่มีอยู่แล้ว
+from config import GlobalConfig  # ✅ ใช้งานร่วมกับ GlobalConfig ของระบบหลัก
 
 # ---------------- Logging ----------------
 log_level_str = GlobalConfig.get('log_level', 'INFO').upper()
@@ -141,7 +141,6 @@ class APIManager:
         results: Dict[str, pd.DataFrame] = {}
 
         try:
-            # ---------- โหลดตลาด ----------
             if not self.markets:
                 self.markets = await self.exchange.load_markets(params={'type': 'future'})
 
@@ -151,7 +150,6 @@ class APIManager:
 
             for idx, symbol in enumerate(usdt_pairs, 1):
                 try:
-                    # ดึงข้อมูล OHLCV
                     data = await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit, since=since)
                     df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
@@ -160,7 +158,6 @@ class APIManager:
                 except Exception as e:
                     logging.warning(f"[{idx}/{total}] ⚠️ ดึงข้อมูล {symbol} ล้มเหลว: {e}")
 
-                # ควบคุม rate limit
                 await asyncio.sleep(delay_per_request)
 
             logging.info(f"✅ ดึงข้อมูลย้อนหลังสำเร็จทั้งหมด {len(results)} เหรียญ")
@@ -171,59 +168,116 @@ class APIManager:
             return {}
 
     # ============================================================
-    # ฟังก์ชันอื่น (คงเดิมทุกอย่าง)
+    # 🧩 ฟังก์ชันใหม่ 3 ตัว (เพิ่มจากคำสั่งของเจ้านาย)
     # ============================================================
 
-    async def fetch_max_leverage(self) -> Dict[str, int]:
-        """ดึงข้อมูล leverage สูงสุดสำหรับแต่ละเหรียญ"""
+    async def create_limit_order_with_trailing(self, symbol: str, side: str, amount: float, price: float, callback_rate: float = 0.005):
+        """
+        ✅ สร้างคำสั่ง Limit + Trailing Stop พร้อม Callback Rate
+        """
         await self.rate_limit_control()
-        if GlobalConfig.get('dry_run'):
-            return self.max_leverage_per_symbol
-        try:
-            info = await self.exchange.fetch_exchange_info(
-                params={'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()}
-            )
-            max_leverage = {}
-            for symbol_info in info['symbols']:
-                symbol = symbol_info['symbol']
-                if symbol.endswith('USDT'):
-                    max_leverage[symbol] = 125
-            self.max_leverage_per_symbol = max_leverage
-            GlobalConfig.set('max_leverage_per_symbol', max_leverage)
-            await self.update_weight(info)
-            logging.info(f"ดึง max_leverage สำเร็จ {len(max_leverage)} เหรียญ")
-            return max_leverage
-        except Exception as e:
-            logging.error(f"ดึง max_leverage ล้มเหลว: {e}")
-            raise
 
-    async def check_balance(self, asset: str = 'USDT') -> Dict:
-        """ตรวจสอบยอดเงินในบัญชี Futures"""
-        await self.rate_limit_control()
         if GlobalConfig.get('dry_run'):
-            return {'free': 1000.0, 'total': 1000.0}
-        try:
-            balance = await self.exchange.fetch_balance(
-                params={'type': 'future', 'recvWindow': 5000, 'timestamp': await self.get_adjusted_timestamp()}
-            )
-            await self.update_weight(balance)
-            return balance.get(asset, {'free': 0, 'total': 0})
-        except Exception as e:
-            logging.error(f"ตรวจสอบ balance ล้มเหลว: {e}")
-            return {'free': 0, 'total': 0}
+            logging.info(f"จำลองคำสั่ง Limit+Trailing {symbol} | Side={side} | Size={amount} | Price={price:.4f}")
+            return True
 
-    async def check_symbol_exists(self, symbol: str) -> bool:
-        """ตรวจสอบว่าเหรียญมีอยู่ใน Binance Futures"""
-        await self.rate_limit_control()
         try:
-            if self.markets is None:
-                self.markets = await self.exchange.load_markets(params={'type': 'future'})
-            return symbol in self.markets
+            api_symbol = symbol.replace("/", "")
+            params = {
+                "symbol": api_symbol,
+                "side": side.upper(),
+                "type": "TRAILING_STOP_MARKET",
+                "quantity": amount,
+                "activationPrice": price,
+                "callbackRate": round(callback_rate * 100, 2),
+                "recvWindow": 5000,
+                "timestamp": await self.get_adjusted_timestamp()
+            }
+
+            order = await self.exchange.fapiPrivate_post_order(params)
+            await self.update_weight(order)
+            logging.info(f"🟢 Limit+Trailing {symbol} | {side.upper()} {amount} @ {price:.4f} | Callback={callback_rate*100:.2f}% ✅")
+            return order
+
         except Exception as e:
-            logging.error(f"ตรวจสอบ symbol {symbol} ล้มเหลว: {e}")
+            logging.error(f"❌ create_limit_order_with_trailing ล้มเหลว ({symbol}): {e}")
+            return None
+
+    async def create_stop_order(self, symbol: str, side: str, amount: float, stop_price: float, params: Optional[dict] = None):
+        """
+        ✅ สร้างคำสั่ง Stop-Market (ใช้ปิดสถานะ)
+        """
+        await self.rate_limit_control()
+
+        if GlobalConfig.get('dry_run'):
+            logging.info(f"จำลอง Stop-Market {symbol} | Side={side} | Stop={stop_price:.4f}")
+            return True
+
+        try:
+            api_symbol = symbol.replace("/", "")
+            body = {
+                "symbol": api_symbol,
+                "side": side.upper(),
+                "type": "STOP_MARKET",
+                "stopPrice": round(stop_price, 2),
+                "closePosition": True,
+                "reduceOnly": True,
+                "recvWindow": 5000,
+                "timestamp": await self.get_adjusted_timestamp()
+            }
+            if params:
+                body.update(params)
+
+            order = await self.exchange.fapiPrivate_post_order(body)
+            await self.update_weight(order)
+            logging.info(f"🔴 Stop-Market {symbol} | {side.upper()} @ {stop_price:.4f} ✅")
+            return order
+
+        except Exception as e:
+            logging.error(f"❌ create_stop_order ล้มเหลว ({symbol}): {e}")
+            return None
+
+    async def update_stop_take_profit(self, symbol: str, stop_price: float, take_price: float):
+        """
+        📡 อัปเดต Stop-Loss / Take-Profit แบบเรียลไทม์ (Trailing)
+        """
+        await self.rate_limit_control()
+
+        if GlobalConfig.get('dry_run'):
+            logging.info(f"จำลองอัปเดต SL/TP {symbol} | SL={stop_price:.4f} | TP={take_price:.4f}")
+            return True
+
+        try:
+            api_symbol = symbol.replace("/", "")
+            # อัปเดต Stop-Loss
+            stop_order = await self.exchange.fapiPrivate_post_order({
+                "symbol": api_symbol,
+                "side": "SELL",
+                "type": "STOP_MARKET",
+                "stopPrice": round(stop_price, 2),
+                "closePosition": True,
+                "reduceOnly": True,
+                "timeInForce": "GTC",
+                "recvWindow": 5000,
+                "timestamp": await self.get_adjusted_timestamp()
+            })
+            # อัปเดต Take-Profit
+            tp_order = await self.exchange.fapiPrivate_post_order({
+                "symbol": api_symbol,
+                "side": "SELL",
+                "type": "TAKE_PROFIT_MARKET",
+                "stopPrice": round(take_price, 2),
+                "closePosition": True,
+                "reduceOnly": True,
+                "timeInForce": "GTC",
+                "recvWindow": 5000,
+                "timestamp": await self.get_adjusted_timestamp()
+            })
+            await self.update_weight(stop_order)
+            await self.update_weight(tp_order)
+            logging.info(f"🟣 Trailing Update | {symbol} | SL={stop_price:.4f} | TP={take_price:.4f} ✅")
+            return True
+
+        except Exception as e:
+            logging.error(f"❌ update_stop_take_profit ล้มเหลว ({symbol}): {e}")
             return False
-
-    async def predict_usage(self) -> float:
-        """คาดการณ์การใช้งาน API ในอนาคต (60 วินาทีข้างหน้า)"""
-        usage_history = [self.weight_used] * 60
-        return sum(usage_history) / len(usage_history) if usage_history else 0
