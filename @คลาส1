@@ -1,13 +1,10 @@
 # ===============================================
-# APIManager Class
+# APIManager Class (Clean Logging)
 # จัดการการเชื่อมต่อ API กับ Binance Futures
-# ใช้ GlobalConfig สำหรับค่าพารามิเตอร์ทั้งหมด
 # ===============================================
 
-# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้
 # pip install ccxt tenacity pandas
 
-import os
 import logging
 import logging.handlers
 import time
@@ -17,7 +14,8 @@ from typing import Optional, Dict, Any, List
 import ccxt.async_support as ccxt_async
 from tenacity import retry, wait_exponential, stop_after_attempt
 import pandas as pd
-from config import GlobalConfig  # ✅ ใช้งานร่วมกับ GlobalConfig ของระบบหลัก
+from config import GlobalConfig
+
 
 # ---------------- Logging ----------------
 log_level_str = GlobalConfig.get('log_level', 'INFO').upper()
@@ -36,32 +34,23 @@ class APIManager:
     """จัดการการเชื่อมต่อและคำสั่งผ่าน Binance Futures API"""
 
     def __init__(self):
-        self.weight_used: int = 0
-        self.weight_limit: int = GlobalConfig.get('rate_limit_per_minute')
-        self.last_reset: float = time.time()
-        self.is_rate_limited: bool = False
-        self.ban_until: float = 0
-        self.request_count: int = 0
-        self.rate_limit_status: Dict[str, int] = {}
-        self.kpi_priority_weight: float = 0
-        self.api_call_timestamps: deque = deque(maxlen=GlobalConfig.get('rate_limit_per_minute'))
-        self.time_offset: int = 0
-        self.last_time_sync: float = time.time()
-        self.max_leverage_per_symbol: Dict[str, int] = GlobalConfig.get('max_leverage_per_symbol', {})
-        self.trailing_orders: Dict[str, Dict[str, Any]] = {}
+        self.weight_used = 0
+        self.weight_limit = GlobalConfig.get('rate_limit_per_minute')
+        self.last_reset = time.time()
+        self.is_rate_limited = False
+        self.ban_until = 0
+        self.api_call_timestamps = deque(maxlen=self.weight_limit)
+        self.time_offset = 0
+        self.last_time_sync = time.time()
         self.markets: Optional[Dict] = None
 
-        # ---------- สร้าง Binance Futures Exchange ----------
         self.exchange = ccxt_async.binance({
             'apiKey': GlobalConfig.get('binance_api_key'),
             'secret': GlobalConfig.get('binance_api_secret'),
             'enableRateLimit': True,
             'timeout': GlobalConfig.get('api_timeout') * 1000,
-            'options': {
-                'defaultType': 'future',
-                'adjustForTimeDifference': True
-            },
-            'rateLimit': int(60000 / GlobalConfig.get('rate_limit_per_minute'))
+            'options': {'defaultType': 'future', 'adjustForTimeDifference': True},
+            'rateLimit': int(60000 / self.weight_limit)
         })
 
     # ============================================================
@@ -69,16 +58,15 @@ class APIManager:
     # ============================================================
 
     async def close(self):
-        """ปิดการเชื่อมต่อ exchange"""
         if self.exchange:
             await self.exchange.close()
 
     async def sync_time_with_exchange(self) -> bool:
-        """ซิงโครไนซ์เวลากับเซิร์ฟเวอร์ Binance"""
+        """ซิงโครไนซ์เวลา"""
         if GlobalConfig.get('dry_run'):
-            logging.info("จำลองการซิงค์เวลา: timeOffset = 0")
             self.time_offset = 0
             self.last_time_sync = time.time()
+            logging.info("🧪 จำลองการซิงค์เวลา: timeOffset = 0")
             return True
         await self.rate_limit_control()
         try:
@@ -86,26 +74,22 @@ class APIManager:
             local_time = int(time.time() * 1000)
             self.time_offset = server_time - local_time
             self.last_time_sync = time.time()
-            logging.info(f"ซิงค์เวลาสำเร็จ: offset = {self.time_offset} ms")
+            logging.info(f"🕒 Sync OK | Offset={self.time_offset} ms")
             return True
         except Exception as e:
-            logging.error(f"ซิงค์เวลาล้มเหลว: {e}")
+            logging.warning(f"⚠️ Sync Time Failed: {e}")
             self.time_offset = 0
             return False
 
     async def get_adjusted_timestamp(self) -> int:
-        """คืนค่า timestamp ที่ปรับตาม timeOffset"""
         return int(time.time() * 1000) + self.time_offset
 
     async def update_weight(self, response: Any):
-        """อัพเดทน้ำหนัก API"""
         if time.time() - self.last_reset >= 60:
             self.weight_used = 0
-            self.rate_limit_status = {}
             self.last_reset = time.time()
 
     async def rate_limit_control(self):
-        """ควบคุมการใช้ API"""
         now = time.time()
         if now - self.last_time_sync >= GlobalConfig.get('sync_time_interval'):
             await self.sync_time_with_exchange()
@@ -115,38 +99,30 @@ class APIManager:
         if self.weight_used >= self.weight_limit * 0.9:
             wait_time = 60 - (now - self.last_reset)
             if wait_time > 0:
-                logging.warning(f"น้ำหนัก API ใกล้เต็ม รอ {wait_time:.2f} วิ")
+                logging.info(f"⏳ API Cooldown {wait_time:.2f}s")
                 await asyncio.sleep(wait_time)
             self.weight_used = 0
             self.last_reset = now
         self.api_call_timestamps.append(now)
 
     # ============================================================
-    # 🔥 ฟังก์ชันใหม่: ดึงข้อมูลย้อนหลังทุกคู่ USDT
+    # ดึงข้อมูลย้อนหลัง
     # ============================================================
 
     @retry(wait=wait_exponential(multiplier=1, min=3, max=60), stop=stop_after_attempt(5))
     async def fetch_all_usdt_historical(
-        self,
-        timeframe: str = "1h",
-        limit: int = 1000,
-        since: Optional[int] = None,
-        delay_per_request: float = 0.2
+        self, timeframe: str = "1h", limit: int = 1000,
+        since: Optional[int] = None, delay_per_request: float = 0.2
     ) -> Dict[str, pd.DataFrame]:
-        """
-        ดึงข้อมูลย้อนหลังของทุกเหรียญที่จับคู่ USDT จาก Binance Futures
-        คืนค่าเป็น dict ของ {symbol: DataFrame}
-        """
+        """ดึงข้อมูลย้อนหลังทุกคู่ USDT"""
         await self.rate_limit_control()
-        results: Dict[str, pd.DataFrame] = {}
-
+        results = {}
         try:
             if not self.markets:
                 self.markets = await self.exchange.load_markets(params={'type': 'future'})
-
-            usdt_pairs: List[str] = [s for s in self.markets if s.endswith('/USDT')]
+            usdt_pairs = [s for s in self.markets if s.endswith('/USDT')]
             total = len(usdt_pairs)
-            logging.info(f"📊 เริ่มดึงข้อมูลย้อนหลัง {total} เหรียญ (timeframe={timeframe})")
+            logging.info(f"📊 ดึงข้อมูลย้อนหลัง {total} เหรียญ (tf={timeframe})")
 
             for idx, symbol in enumerate(usdt_pairs, 1):
                 try:
@@ -154,33 +130,26 @@ class APIManager:
                     df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
                     results[symbol] = df
-                    logging.info(f"[{idx}/{total}] ✅ {symbol}: {len(df)} แถว")
+                    logging.debug(f"[{idx}/{total}] {symbol}: {len(df)} rows")
                 except Exception as e:
-                    logging.warning(f"[{idx}/{total}] ⚠️ ดึงข้อมูล {symbol} ล้มเหลว: {e}")
-
+                    logging.warning(f"[{idx}/{total}] ⚠️ {symbol}: {e}")
                 await asyncio.sleep(delay_per_request)
 
-            logging.info(f"✅ ดึงข้อมูลย้อนหลังสำเร็จทั้งหมด {len(results)} เหรียญ")
+            logging.info(f"✅ ดึงข้อมูลย้อนหลังสำเร็จ {len(results)} เหรียญ")
             return results
-
         except Exception as e:
-            logging.error(f"❌ fetch_all_usdt_historical ล้มเหลว: {e}")
+            logging.error(f"❌ Fetch Historical Error: {e}")
             return {}
 
     # ============================================================
-    # 🧩 ฟังก์ชันใหม่ 3 ตัว (เพิ่มจากคำสั่งของเจ้านาย)
+    # คำสั่ง API (ไม่มี log ซ้ำกับ main)
     # ============================================================
 
     async def create_limit_order_with_trailing(self, symbol: str, side: str, amount: float, price: float, callback_rate: float = 0.005):
-        """
-        ✅ สร้างคำสั่ง Limit + Trailing Stop พร้อม Callback Rate
-        """
+        """สร้าง Limit + Trailing"""
         await self.rate_limit_control()
-
         if GlobalConfig.get('dry_run'):
-            logging.info(f"จำลองคำสั่ง Limit+Trailing {symbol} | Side={side} | Size={amount} | Price={price:.4f}")
             return True
-
         try:
             api_symbol = symbol.replace("/", "")
             params = {
@@ -193,26 +162,18 @@ class APIManager:
                 "recvWindow": 5000,
                 "timestamp": await self.get_adjusted_timestamp()
             }
-
             order = await self.exchange.fapiPrivate_post_order(params)
             await self.update_weight(order)
-            logging.info(f"🟢 Limit+Trailing {symbol} | {side.upper()} {amount} @ {price:.4f} | Callback={callback_rate*100:.2f}% ✅")
             return order
-
         except Exception as e:
-            logging.error(f"❌ create_limit_order_with_trailing ล้มเหลว ({symbol}): {e}")
+            logging.error(f"API Error: create_limit_order_with_trailing({symbol}) → {e}")
             return None
 
     async def create_stop_order(self, symbol: str, side: str, amount: float, stop_price: float, params: Optional[dict] = None):
-        """
-        ✅ สร้างคำสั่ง Stop-Market (ใช้ปิดสถานะ)
-        """
+        """สร้าง Stop-Market"""
         await self.rate_limit_control()
-
         if GlobalConfig.get('dry_run'):
-            logging.info(f"จำลอง Stop-Market {symbol} | Side={side} | Stop={stop_price:.4f}")
             return True
-
         try:
             api_symbol = symbol.replace("/", "")
             body = {
@@ -227,57 +188,41 @@ class APIManager:
             }
             if params:
                 body.update(params)
-
             order = await self.exchange.fapiPrivate_post_order(body)
             await self.update_weight(order)
-            logging.info(f"🔴 Stop-Market {symbol} | {side.upper()} @ {stop_price:.4f} ✅")
             return order
-
         except Exception as e:
-            logging.error(f"❌ create_stop_order ล้มเหลว ({symbol}): {e}")
+            logging.error(f"API Error: create_stop_order({symbol}) → {e}")
             return None
 
     async def update_stop_take_profit(self, symbol: str, stop_price: float, take_price: float):
-        """
-        📡 อัปเดต Stop-Loss / Take-Profit แบบเรียลไทม์ (Trailing)
-        """
+        """อัปเดต Stop-Loss / Take-Profit แบบเรียลไทม์"""
         await self.rate_limit_control()
-
         if GlobalConfig.get('dry_run'):
-            logging.info(f"จำลองอัปเดต SL/TP {symbol} | SL={stop_price:.4f} | TP={take_price:.4f}")
             return True
-
         try:
             api_symbol = symbol.replace("/", "")
-            # อัปเดต Stop-Loss
-            stop_order = await self.exchange.fapiPrivate_post_order({
+            await self.exchange.fapiPrivate_post_order({
                 "symbol": api_symbol,
                 "side": "SELL",
                 "type": "STOP_MARKET",
                 "stopPrice": round(stop_price, 2),
                 "closePosition": True,
                 "reduceOnly": True,
-                "timeInForce": "GTC",
                 "recvWindow": 5000,
                 "timestamp": await self.get_adjusted_timestamp()
             })
-            # อัปเดต Take-Profit
-            tp_order = await self.exchange.fapiPrivate_post_order({
+            await self.exchange.fapiPrivate_post_order({
                 "symbol": api_symbol,
                 "side": "SELL",
                 "type": "TAKE_PROFIT_MARKET",
                 "stopPrice": round(take_price, 2),
                 "closePosition": True,
                 "reduceOnly": True,
-                "timeInForce": "GTC",
                 "recvWindow": 5000,
                 "timestamp": await self.get_adjusted_timestamp()
             })
-            await self.update_weight(stop_order)
-            await self.update_weight(tp_order)
-            logging.info(f"🟣 Trailing Update | {symbol} | SL={stop_price:.4f} | TP={take_price:.4f} ✅")
             return True
-
         except Exception as e:
-            logging.error(f"❌ update_stop_take_profit ล้มเหลว ({symbol}): {e}")
+            logging.error(f"API Error: update_stop_take_profit({symbol}) → {e}")
             return False
