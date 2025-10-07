@@ -1,6 +1,6 @@
 # =============================================== 
-# APIManager Class (Clean Logging + Limit Trading + TP/SL + Trailing + Auto Update)
-# จัดการการเชื่อมต่อ API กับ Binance Futures (พร้อมซิงค์สดกับ config.py)
+# APIManager Class (Clean Logging + Limit Trading + TP/SL + Trailing + Auto Update + Live Config Sync)
+# จัดการการเชื่อมต่อ API กับ Binance Futures (พร้อมตรวจสอบ dry_run สดจาก GlobalConfig)
 # ===============================================
 
 # pip install ccxt tenacity pandas
@@ -45,7 +45,8 @@ class APIManager:
         self.markets: Optional[Dict] = None
 
         # ✅ ตัวแปรเสริม
-        self.dry_run = GlobalConfig.get('dry_run', True)
+        self.dry_run = GlobalConfig.get('dry_run', False)
+        self._last_dry_run_value = self.dry_run
         self.margin_mode = GlobalConfig.get('margin_mode', 'isolated')
         self.trailing_orders: Dict[str, Dict[str, Any]] = {}
 
@@ -63,7 +64,10 @@ class APIManager:
             'rateLimit': int(60000 / self.weight_limit)
         })
 
-        logging.info(f"🔄 Real-Time Sync Enabled | Margin Mode = {self.margin_mode.upper()}")
+        # ✅ เริ่มต้นตัวตรวจสอบ config สด
+        asyncio.create_task(self._monitor_config_changes())
+
+        logging.info(f"🔄 Real-Time Sync Enabled | Margin Mode = {self.margin_mode.upper()} | DryRun = {self.dry_run}")
 
     # ============================================================
     # CONFIG SYNC
@@ -76,6 +80,19 @@ class APIManager:
         except Exception as e:
             logging.error(f"⚠️ Error refreshing config: {e}")
             self.dry_run = True
+
+    async def _monitor_config_changes(self):
+        """ตรวจสอบค่าจาก GlobalConfig แบบเรียลไทม์"""
+        while True:
+            try:
+                current_value = GlobalConfig.get('dry_run', True)
+                if current_value != self._last_dry_run_value:
+                    logging.info(f"🔁 [Config Sync] dry_run ถูกเปลี่ยน: {self._last_dry_run_value} → {current_value}")
+                    self.dry_run = current_value
+                    self._last_dry_run_value = current_value
+            except Exception as e:
+                logging.warning(f"⚠️ Config Monitor Error: {e}")
+            await asyncio.sleep(3)
 
     # ============================================================
     # BASIC FUNCTIONS
@@ -173,22 +190,18 @@ class APIManager:
         trailing_tp: float = None, trailing_sl: float = None,
         leverage: int = 20
     ):
-        """
-        ✅ สร้างคำสั่ง Limit Order พร้อม TP, SL, Trailing
-        """
+        """✅ สร้างคำสั่ง Limit Order พร้อม TP, SL, Trailing"""
         await self.rate_limit_control()
         self._refresh_config()
 
         if self.dry_run:
-            logging.info(f"[DryRun] Skip order: {side} {symbol} {amount}@{price}")
+            logging.info(f"🧪 [DryRun] จำลองคำสั่ง: {side.upper()} {symbol} {amount}@{price}")
             return None
 
         try:
-            # ตั้งค่าเลเวอเรจและโหมดมาร์จิ้น
             await self.exchange.set_leverage(leverage, symbol)
             await self.exchange.set_margin_mode(self.margin_mode, symbol)
 
-            # Limit Order หลัก
             order = await self.exchange.create_order(
                 symbol=symbol,
                 type="limit",
@@ -200,13 +213,11 @@ class APIManager:
 
             logging.info(f"✅ Limit {side.upper()} {symbol} @ {price} | Lev={leverage}x | Margin={self.margin_mode.upper()}")
 
-            # ตั้ง TP/SL
             if take_profit:
                 await self._create_tp(symbol, side, amount, take_profit)
             if stop_loss:
                 await self._create_sl(symbol, side, amount, stop_loss)
 
-            # Trailing
             if trailing_tp or trailing_sl:
                 self.trailing_orders[symbol] = {
                     "side": side,
@@ -216,14 +227,12 @@ class APIManager:
                     "last_update": time.time()
                 }
                 logging.info(f"🌀 ตั้ง Trailing Order: TP={trailing_tp}, SL={trailing_sl}")
-
             return order
         except Exception as e:
             logging.error(f"❌ Limit Order Error: {e}")
             return None
 
     async def _create_tp(self, symbol: str, side: str, amount: float, price: float):
-        """สร้าง Take Profit"""
         opposite = "sell" if side.lower() == "buy" else "buy"
         try:
             await self.exchange.create_order(
@@ -238,7 +247,6 @@ class APIManager:
             logging.warning(f"⚠️ TP Error {symbol}: {e}")
 
     async def _create_sl(self, symbol: str, side: str, amount: float, price: float):
-        """สร้าง Stop-Loss"""
         opposite = "sell" if side.lower() == "buy" else "buy"
         try:
             await self.exchange.create_order(
@@ -259,6 +267,7 @@ class APIManager:
         """ตรวจสอบและอัปเดต Trailing Orders อัตโนมัติ"""
         while True:
             try:
+                self._refresh_config()
                 for symbol, info in list(self.trailing_orders.items()):
                     side = info['side']
                     tp = info.get('tp')
@@ -278,7 +287,6 @@ class APIManager:
                         info['sl'] = new_sl
                         await self._create_sl(symbol, side, info['amount'], new_sl)
                         logging.info(f"🔁 ปรับ SL ใหม่ {symbol} → {new_sl:.4f}")
-
                 await asyncio.sleep(5)
             except Exception as e:
                 logging.error(f"⚠️ Trailing Monitor Error: {e}")
@@ -288,9 +296,12 @@ class APIManager:
     # CLOSE ORDERS
     # ============================================================
     async def close_position(self, symbol: str, side: str, amount: float):
-        """ปิดสถานะฝั่ง Long หรือ Short"""
         opposite = "sell" if side.lower() == "buy" else "buy"
+        self._refresh_config()
         try:
+            if self.dry_run:
+                logging.info(f"🧪 [DryRun] จำลองการปิดสถานะ {side.upper()} {symbol}")
+                return True
             await self.exchange.create_order(
                 symbol=symbol,
                 type="market",
