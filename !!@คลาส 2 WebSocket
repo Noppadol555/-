@@ -1,5 +1,5 @@
 # ===============================================
-# websocket_manager.py  (Auto Fetch All USDT Pairs for Binance Futures • Safe Funding Rate)
+# websocket_manager.py  (Auto Fetch All USDT Pairs for Binance Futures • Safe Funding Rate • Historical Buffer)
 # ===============================================
 
 import json
@@ -11,8 +11,10 @@ import sqlite3
 import websockets
 import aiohttp
 from datetime import timedelta
+from collections import deque  # ✅ เพิ่มสำหรับ buffer ราคาย้อนหลัง
 from tenacity import retry, wait_exponential, stop_after_attempt
 from config import GlobalConfig
+import pandas as pd  # ✅ เพิ่มเพื่อคืนค่า DataFrame ให้ IndicatorCalculator ใช้ได้ตรง ๆ
 
 # --------------------------- Logging ---------------------------
 logging.basicConfig(
@@ -31,7 +33,7 @@ DSTREAM_BASE = "wss://dstream.binance.com"
 
 
 class WebSocketManager:
-    """WebSocket Manager สำหรับ Binance Futures (พร้อม funding_rate ปลอดภัย)"""
+    """WebSocket Manager สำหรับ Binance Futures (พร้อม funding_rate ปลอดภัย + Historical Buffer)"""
 
     def __init__(self, exchange=None, time_offset: int = 0):
         self.public_base = FSTREAM_BASE
@@ -51,6 +53,9 @@ class WebSocketManager:
         self.last_data_time = time.time()
         self.all_usdt_pairs = []
         self.balance_data = {"free": 0.0, "locked": 0.0}
+
+        # ✅ เพิ่ม buffer สำหรับเก็บข้อมูลราคาย้อนหลัง
+        self.price_buffer = {}  # {symbol: deque(maxlen=N)}
 
         # --------- SQLite ---------
         self.db_conn = sqlite3.connect(
@@ -258,6 +263,15 @@ class WebSocketManager:
             }
             self.cache[symbol] = self.data[symbol]
 
+            # ✅ เพิ่มการเก็บ buffer ราคาย้อนหลัง
+            if symbol not in self.price_buffer:
+                self.price_buffer[symbol] = deque(maxlen=500)
+            self.price_buffer[symbol].append({
+                "timestamp": ts,
+                "close": price,
+                "volume": vol
+            })
+
             self.db_conn.execute(
                 "INSERT INTO ws_data (symbol, timestamp, close, volume, funding_rate, depth) VALUES (?, ?, ?, ?, ?, ?)",
                 (symbol, ts, price, vol, funding_rate, 0),
@@ -317,3 +331,15 @@ class WebSocketManager:
         for s in symbols:
             self.data[s] = {"timestamp": now, "close": 0.0, "volume": 0.0, "funding_rate": 0.0, "depth": {}}
         logging.warning("⚠️ ใช้ข้อมูลจำลองเพื่อให้ระบบทำงานต่อ")
+
+    # ---------------------- Historical Buffer Interface ----------------------
+    def get_recent_ohlcv(self, symbol: str, limit: int = 100) -> pd.DataFrame:
+        """✅ คืนค่า OHLCV จาก buffer ล่าสุด (ใช้คำนวณอินดิเคเตอร์ได้จริง)"""
+        data = list(self.price_buffer.get(symbol, []))[-limit:]
+        if not data:
+            return pd.DataFrame()
+        df = pd.DataFrame(data)
+        df["open"] = df["close"].shift(1).fillna(df["close"])
+        df["high"] = df["close"] * 1.001
+        df["low"] = df["close"] * 0.999
+        return df[["open", "high", "low", "close", "volume"]]
