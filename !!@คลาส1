@@ -3,7 +3,7 @@
 # จัดการการเชื่อมต่อ API กับ Binance Futures (พร้อมตรวจสอบ dry_run สดจาก GlobalConfig)
 # ===============================================
 
-# pip install ccxt tenacity pandas
+# pip install -U ccxt tenacity pandas
 
 import logging
 import logging.handlers
@@ -34,65 +34,93 @@ class APIManager:
     """จัดการการเชื่อมต่อและคำสั่งผ่าน Binance Futures API"""
 
     def __init__(self):
+        self._load_config()
         self.weight_used = 0
-        self.weight_limit = GlobalConfig.get('rate_limit_per_minute')
         self.last_reset = time.time()
         self.is_rate_limited = False
         self.ban_until = 0
-        self.api_call_timestamps = deque(maxlen=self.weight_limit)
-        self.time_offset = 0
+        self.api_call_timestamps = deque(maxlen=self.rate_limit)
         self.last_time_sync = time.time()
         self.markets: Optional[Dict] = None
-
-        # ✅ ตัวแปรเสริม
-        self.dry_run = GlobalConfig.get('dry_run', False)
-        self._last_dry_run_value = self.dry_run
-        self.margin_mode = GlobalConfig.get('margin_mode', 'isolated')
         self.trailing_orders: Dict[str, Dict[str, Any]] = {}
 
-        # ✅ เชื่อมต่อ Binance Futures ผ่าน ccxt
-        self.exchange = ccxt_async.binance({
-            'apiKey': GlobalConfig.get('binance_api_key'),
-            'secret': GlobalConfig.get('binance_api_secret'),
+        # ✅ สร้างการเชื่อมต่อ Binance Futures
+        self.exchange = self._create_exchange()
+
+        # ✅ เริ่มต้นตัวตรวจสอบ config สด
+        asyncio.create_task(self._monitor_config_changes())
+        logging.info(f"🔄 Real-Time Sync Enabled | Margin Mode = {self.margin_mode.upper()} | DryRun = {self.dry_run}")
+
+    # ============================================================
+    # CONFIG HANDLING
+    # ============================================================
+    def _load_config(self):
+        """โหลดค่าทั้งหมดจาก GlobalConfig"""
+        try:
+            self.api_key = GlobalConfig.get('binance_api_key')
+            self.api_secret = GlobalConfig.get('binance_api_secret')
+            self.dry_run = GlobalConfig.get('dry_run', False)
+            self.max_api_retries = GlobalConfig.get('max_api_retries', 10)
+            self.api_timeout = GlobalConfig.get('api_timeout', 30)
+            self.rate_limit = GlobalConfig.get('rate_limit_per_minute', 2400)
+            self.margin_mode = GlobalConfig.get('margin_mode', 'isolated')
+            self.min_leverage = GlobalConfig.get('min_leverage', 50)
+            self.trailing_callback_rate = GlobalConfig.get('trailing_callback_rate', 0.5)
+            self.trailing_update_interval = GlobalConfig.get('trailing_update_interval', 60)
+            self.sync_time_interval = GlobalConfig.get('sync_time_interval', 3600)
+            self.futures_weight = GlobalConfig.get('futures_weight', 0.9)
+        except Exception as e:
+            logging.error(f"⚠️ Config Load Error: {e}")
+
+    async def _monitor_config_changes(self):
+        """ตรวจสอบและอัปเดตค่าจาก GlobalConfig แบบเรียลไทม์"""
+        last_snapshot = {}
+        while True:
+            try:
+                current = {
+                    'dry_run': GlobalConfig.get('dry_run', False),
+                    'margin_mode': GlobalConfig.get('margin_mode', 'isolated'),
+                    'api_timeout': GlobalConfig.get('api_timeout', 30),
+                    'rate_limit_per_minute': GlobalConfig.get('rate_limit_per_minute', 2400),
+                    'trailing_callback_rate': GlobalConfig.get('trailing_callback_rate', 0.5),
+                    'trailing_update_interval': GlobalConfig.get('trailing_update_interval', 60),
+                }
+
+                for key, new_value in current.items():
+                    old_value = last_snapshot.get(key)
+                    if old_value is not None and old_value != new_value:
+                        setattr(self, key if key != 'rate_limit_per_minute' else 'rate_limit', new_value)
+                        logging.info(f"🔁 [Config Sync] {key} ถูกเปลี่ยน: {old_value} → {new_value}")
+                        if key in ['api_timeout', 'margin_mode']:
+                            self._reconnect_exchange()
+                    last_snapshot[key] = new_value
+            except Exception as e:
+                logging.warning(f"⚠️ Config Monitor Error: {e}")
+            await asyncio.sleep(5)
+
+    def _reconnect_exchange(self):
+        """รีสร้าง connection ใหม่เมื่อ config สำคัญเปลี่ยน"""
+        try:
+            asyncio.create_task(self.exchange.close())
+        except Exception:
+            pass
+        self.exchange = self._create_exchange()
+        logging.info("♻️ Exchange Reconnected with updated configuration")
+
+    def _create_exchange(self):
+        """สร้างการเชื่อมต่อ Binance Futures ผ่าน ccxt"""
+        return ccxt_async.binance({
+            'apiKey': self.api_key,
+            'secret': self.api_secret,
             'enableRateLimit': True,
-            'timeout': GlobalConfig.get('api_timeout') * 1000,
+            'timeout': self.api_timeout * 1000,
             'options': {
                 'defaultType': 'future',
                 'adjustForTimeDifference': True,
                 'defaultMarginMode': self.margin_mode
             },
-            'rateLimit': int(60000 / self.weight_limit)
+            'rateLimit': int(60000 / self.rate_limit)
         })
-
-        # ✅ เริ่มต้นตัวตรวจสอบ config สด
-        asyncio.create_task(self._monitor_config_changes())
-
-        logging.info(f"🔄 Real-Time Sync Enabled | Margin Mode = {self.margin_mode.upper()} | DryRun = {self.dry_run}")
-
-    # ============================================================
-    # CONFIG SYNC
-    # ============================================================
-    def _refresh_config(self):
-        """รีโหลดค่าจาก GlobalConfig"""
-        try:
-            self.dry_run = GlobalConfig.get('dry_run', True)
-            self.margin_mode = GlobalConfig.get('margin_mode', 'isolated')
-        except Exception as e:
-            logging.error(f"⚠️ Error refreshing config: {e}")
-            self.dry_run = True
-
-    async def _monitor_config_changes(self):
-        """ตรวจสอบค่าจาก GlobalConfig แบบเรียลไทม์"""
-        while True:
-            try:
-                current_value = GlobalConfig.get('dry_run', True)
-                if current_value != self._last_dry_run_value:
-                    logging.info(f"🔁 [Config Sync] dry_run ถูกเปลี่ยน: {self._last_dry_run_value} → {current_value}")
-                    self.dry_run = current_value
-                    self._last_dry_run_value = current_value
-            except Exception as e:
-                logging.warning(f"⚠️ Config Monitor Error: {e}")
-            await asyncio.sleep(3)
 
     # ============================================================
     # BASIC FUNCTIONS
@@ -103,9 +131,7 @@ class APIManager:
 
     async def sync_time_with_exchange(self) -> bool:
         """ซิงโครไนซ์เวลา"""
-        self._refresh_config()
         if self.dry_run:
-            self.time_offset = 0
             self.last_time_sync = time.time()
             logging.info("🧪 จำลองการซิงค์เวลา: timeOffset = 0")
             return True
@@ -122,22 +148,14 @@ class APIManager:
             self.time_offset = 0
             return False
 
-    async def get_adjusted_timestamp(self) -> int:
-        return int(time.time() * 1000) + self.time_offset
-
-    async def update_weight(self, response: Any):
-        if time.time() - self.last_reset >= 60:
-            self.weight_used = 0
-            self.last_reset = time.time()
-
     async def rate_limit_control(self):
         now = time.time()
-        if now - self.last_time_sync >= GlobalConfig.get('sync_time_interval'):
+        if now - self.last_time_sync >= self.sync_time_interval:
             await self.sync_time_with_exchange()
         if self.is_rate_limited and now < self.ban_until:
             await asyncio.sleep(self.ban_until - now)
             self.is_rate_limited = False
-        if self.weight_used >= self.weight_limit * 0.9:
+        if self.weight_used >= self.rate_limit * 0.9:
             wait_time = 60 - (now - self.last_reset)
             if wait_time > 0:
                 logging.info(f"⏳ API Cooldown {wait_time:.2f}s")
@@ -182,7 +200,7 @@ class APIManager:
             return {}
 
     # ============================================================
-    # REAL TRADE MANAGEMENT
+    # ORDER MANAGEMENT (ปรับให้ถูกต้องตาม Binance Futures API v2)
     # ============================================================
     async def execute_limit_order(
         self, symbol: str, side: str, amount: float,
@@ -192,7 +210,7 @@ class APIManager:
     ):
         """✅ สร้างคำสั่ง Limit Order พร้อม TP, SL, Trailing"""
         await self.rate_limit_control()
-        self._refresh_config()
+        leverage = max(leverage, self.min_leverage)
 
         if self.dry_run:
             logging.info(f"🧪 [DryRun] จำลองคำสั่ง: {side.upper()} {symbol} {amount}@{price}")
@@ -202,13 +220,21 @@ class APIManager:
             await self.exchange.set_leverage(leverage, symbol)
             await self.exchange.set_margin_mode(self.margin_mode, symbol)
 
+            params = {
+                "reduceOnly": False,
+                "positionSide": "LONG" if side.lower() == "buy" else "SHORT",
+                "workingType": "MARK_PRICE",
+                "timeInForce": "GTC",
+                "type": "future"
+            }
+
             order = await self.exchange.create_order(
                 symbol=symbol,
-                type="limit",
+                type="LIMIT",
                 side=side.lower(),
                 amount=amount,
                 price=price,
-                params={"reduceOnly": False}
+                params=params
             )
 
             logging.info(f"✅ Limit {side.upper()} {symbol} @ {price} | Lev={leverage}x | Margin={self.margin_mode.upper()}")
@@ -233,6 +259,7 @@ class APIManager:
             return None
 
     async def _create_tp(self, symbol: str, side: str, amount: float, price: float):
+        """Take-Profit Market Order"""
         opposite = "sell" if side.lower() == "buy" else "buy"
         try:
             await self.exchange.create_order(
@@ -240,13 +267,20 @@ class APIManager:
                 type="TAKE_PROFIT_MARKET",
                 side=opposite,
                 amount=amount,
-                params={"stopPrice": round(price, 2), "reduceOnly": True}
+                params={
+                    "stopPrice": round(price, 2),
+                    "reduceOnly": True,
+                    "closePosition": True,
+                    "workingType": "MARK_PRICE",
+                    "positionSide": "LONG" if side.lower() == "buy" else "SHORT"
+                }
             )
             logging.info(f"🎯 ตั้ง Take-Profit {symbol} ที่ {price}")
         except Exception as e:
             logging.warning(f"⚠️ TP Error {symbol}: {e}")
 
     async def _create_sl(self, symbol: str, side: str, amount: float, price: float):
+        """Stop-Loss Market Order"""
         opposite = "sell" if side.lower() == "buy" else "buy"
         try:
             await self.exchange.create_order(
@@ -254,20 +288,25 @@ class APIManager:
                 type="STOP_MARKET",
                 side=opposite,
                 amount=amount,
-                params={"stopPrice": round(price, 2), "reduceOnly": True}
+                params={
+                    "stopPrice": round(price, 2),
+                    "reduceOnly": True,
+                    "closePosition": True,
+                    "workingType": "MARK_PRICE",
+                    "positionSide": "LONG" if side.lower() == "buy" else "SHORT"
+                }
             )
             logging.info(f"🛑 ตั้ง Stop-Loss {symbol} ที่ {price}")
         except Exception as e:
             logging.warning(f"⚠️ SL Error {symbol}: {e}")
 
     # ============================================================
-    # AUTO TRAILING / UPDATE ORDERS
+    # TRAILING MANAGEMENT
     # ============================================================
     async def monitor_trailing_orders(self):
         """ตรวจสอบและอัปเดต Trailing Orders อัตโนมัติ"""
         while True:
             try:
-                self._refresh_config()
                 for symbol, info in list(self.trailing_orders.items()):
                     side = info['side']
                     tp = info.get('tp')
@@ -277,37 +316,40 @@ class APIManager:
                     price = ticker['last']
 
                     if tp and ((side == "buy" and price > tp) or (side == "sell" and price < tp)):
-                        new_tp = price * (1 + 0.002 if side == "buy" else 1 - 0.002)
+                        new_tp = price * (1 + self.trailing_callback_rate / 100 if side == "buy" else 1 - self.trailing_callback_rate / 100)
                         info['tp'] = new_tp
                         await self._create_tp(symbol, side, info['amount'], new_tp)
                         logging.info(f"🔁 ปรับ TP ใหม่ {symbol} → {new_tp:.4f}")
 
                     if sl and ((side == "buy" and price < sl) or (side == "sell" and price > sl)):
-                        new_sl = price * (1 - 0.002 if side == "buy" else 1 + 0.002)
+                        new_sl = price * (1 - self.trailing_callback_rate / 100 if side == "buy" else 1 + self.trailing_callback_rate / 100)
                         info['sl'] = new_sl
                         await self._create_sl(symbol, side, info['amount'], new_sl)
                         logging.info(f"🔁 ปรับ SL ใหม่ {symbol} → {new_sl:.4f}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(self.trailing_update_interval)
             except Exception as e:
                 logging.error(f"⚠️ Trailing Monitor Error: {e}")
                 await asyncio.sleep(10)
 
     # ============================================================
-    # CLOSE ORDERS
+    # CLOSE POSITION
     # ============================================================
     async def close_position(self, symbol: str, side: str, amount: float):
         opposite = "sell" if side.lower() == "buy" else "buy"
-        self._refresh_config()
+        if self.dry_run:
+            logging.info(f"🧪 [DryRun] จำลองการปิดสถานะ {side.upper()} {symbol}")
+            return True
         try:
-            if self.dry_run:
-                logging.info(f"🧪 [DryRun] จำลองการปิดสถานะ {side.upper()} {symbol}")
-                return True
             await self.exchange.create_order(
                 symbol=symbol,
-                type="market",
+                type="MARKET",
                 side=opposite,
                 amount=amount,
-                params={"reduceOnly": True}
+                params={
+                    "reduceOnly": True,
+                    "closePosition": True,
+                    "positionSide": "LONG" if side.lower() == "buy" else "SHORT"
+                }
             )
             logging.info(f"🚪 ปิดสถานะ {side.upper()} {symbol}")
         except Exception as e:
