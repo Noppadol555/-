@@ -1,0 +1,159 @@
+# ===============================================
+# dynamic_indicator_generator.py
+# (Auto-Sync with WebSocketManager + IndicatorCalculator)
+# ===============================================
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install torch numpy torch-geometric pandas ta aiohttp
+
+import asyncio
+import torch
+import numpy as np
+import pandas as pd
+import logging
+from torch_geometric.data import Data
+from config import GlobalConfig
+import ta
+import time
+
+# ===============================================
+# IndicatorCalculator (Auto Sync จาก WebSocketManager)
+# ===============================================
+class IndicatorCalculator:
+    """คำนวณอินดิเคเตอร์หลาย Timeframe โดยดึงข้อมูลจาก WebSocketManager อัตโนมัติ"""
+
+    def __init__(self, ws_manager: WebSocketManager):
+        self.ws_manager = ws_manager
+        self.multi_tf_data = {}
+        self.last_update = 0
+        self.multi_tf_list = GlobalConfig.get("multi_tf_list", ["1m", "5m", "1h"])
+        self.sync_interval = int(GlobalConfig.get("indicator_sync_interval", 60))
+        asyncio.create_task(self._auto_sync_loop())
+
+    async def _auto_sync_loop(self):
+        """อัปเดต multi_tf_data อัตโนมัติจาก WebSocketManager"""
+        await asyncio.sleep(2)
+        while True:
+            try:
+                self._sync_from_ws_manager()
+                await asyncio.sleep(self.sync_interval)
+            except Exception as e:
+                logging.error(f"Indicator sync error: {e}")
+                await asyncio.sleep(10)
+
+    def _sync_from_ws_manager(self):
+        """สร้าง multi_tf_data จากข้อมูลสดใน ws_manager"""
+        now = time.time()
+        if now - self.last_update < self.sync_interval:
+            return
+        base_data = self.ws_manager.data.copy()
+        self.multi_tf_data = {tf: {} for tf in self.multi_tf_list}
+        for symbol, d in base_data.items():
+            price = d.get("close", 0.0)
+            vol = d.get("volume", 0.0)
+            for tf in self.multi_tf_list:
+                df = pd.DataFrame({
+                    "open": [price * 0.999],
+                    "high": [price * 1.001],
+                    "low": [price * 0.998],
+                    "close": [price],
+                    "volume": [vol],
+                })
+                self.multi_tf_data[tf][symbol] = df
+        self.last_update = now
+        logging.info(f"✅ อัปเดต multi_tf_data สำเร็จ ({len(base_data)} symbols)")
+
+    def calculate_indicators(self, symbol):
+        indicators = {}
+        if not self.multi_tf_data:
+            logging.warning("⚠️ multi_tf_data ยังไม่มีข้อมูล (รอ sync)")
+            return indicators
+        for tf in self.multi_tf_list:
+            df = self.multi_tf_data.get(tf, {}).get(symbol, pd.DataFrame())
+            if df.empty or "close" not in df:
+                continue
+            close = pd.Series(df["close"])
+            high = pd.Series(df["high"]) if "high" in df else close
+            low = pd.Series(df["low"]) if "low" in df else close
+            volume = pd.Series(df["volume"]) if "volume" in df else pd.Series([0])
+            indicators[tf] = {
+                "ATR": ta.volatility.AverageTrueRange(high, low, close).average_true_range().iloc[-1] if len(close) >= 14 else 0,
+                "RSI": ta.momentum.RSIIndicator(close).rsi().iloc[-1] if len(close) >= 14 else 50,
+                "MACD": ta.trend.MACD(close).macd().iloc[-1] if len(close) >= 26 else 0,
+                "EMA": ta.trend.EMAIndicator(close, window=20).ema_indicator().iloc[-1] if len(close) >= 20 else close.iloc[-1],
+                "BB_upper": ta.volatility.BollingerBands(close).bollinger_hband().iloc[-1] if len(close) >= 20 else close.iloc[-1],
+                "BB_lower": ta.volatility.BollingerBands(close).bollinger_lband().iloc[-1] if len(close) >= 20 else close.iloc[-1],
+                "SMA": ta.trend.SMAIndicator(close, window=20).sma_indicator().iloc[-1] if len(close) >= 20 else close.iloc[-1],
+                "Stoch_RSI": ta.momentum.StochasticRSIIndicator(close).stochrsi().iloc[-1] if len(close) >= 14 else 0.5,
+                "OBV": ta.volume.OnBalanceVolumeIndicator(close, volume).on_balance_volume().iloc[-1] if len(close) > 1 else volume.iloc[-1],
+                "Volume": float(volume.iloc[-1]),
+            }
+        return indicators
+
+    def get_multi_tf_data(self):
+        return self.multi_tf_data
+
+
+# ===============================================
+# DynamicIndicatorGenerator (Auto ใช้ IndicatorCalculator)
+# ===============================================
+class DynamicIndicatorGenerator:
+    """สร้าง indicators แบบผสม GAN + GNN โดยดึงข้อมูลสดจาก WebSocketManager"""
+
+    def __init__(self, evogan, gnn, ws_manager: WebSocketManager):
+        self.evogan = evogan
+        self.gnn = gnn
+        self.ws_manager = ws_manager
+        # ✅ ใช้ IndicatorCalculator ที่ sync อัตโนมัติ
+        self.base_calc = IndicatorCalculator(ws_manager)
+        self.feature_weights = torch.tensor([
+            1.0, 0.5, 1.0, 1.0, 0.5,
+            0.5, 0.5, 0.5, 1.0, 1.0
+        ]).to(self.evogan.device)
+
+    def generate_synthetic_indicators(self, symbol):
+        synthetic = {}
+        base_ind = self.base_calc.calculate_indicators(symbol)
+        for tf in GlobalConfig.get("multi_tf_list", ["1m"]):
+            if tf not in base_ind:
+                continue
+            base_features = np.array([
+                base_ind[tf]["ATR"], base_ind[tf]["MACD"], base_ind[tf]["EMA"],
+                base_ind[tf]["OBV"], base_ind[tf]["Volume"],
+                base_ind[tf]["RSI"], base_ind[tf]["BB_upper"], base_ind[tf]["BB_lower"],
+                base_ind[tf]["SMA"], base_ind[tf]["Stoch_RSI"]
+            ])
+            weighted_features = base_features * self.feature_weights.cpu().numpy()
+            synthetic_features = self.evogan.generate(
+                torch.FloatTensor(weighted_features).to(self.evogan.device)
+            ).cpu().numpy()
+            graph = self._create_asset_graph()
+            gnn_features = self.gnn.forward(
+                torch.FloatTensor(synthetic_features).to(self.gnn.device), graph
+            ).cpu().numpy()
+            synthetic[tf] = {
+                "base": base_ind[tf],
+                "synthetic": synthetic_features,
+                "gnn_correlations": gnn_features,
+            }
+        return synthetic
+
+    def _create_asset_graph(self):
+        multi_tf_data = self.base_calc.get_multi_tf_data()
+        tf0 = GlobalConfig.get("multi_tf_list", ["1m"])[0]
+        if tf0 not in multi_tf_data:
+            return Data(edge_index=torch.tensor([[0, 0]], dtype=torch.long).t().to(self.gnn.device))
+        num_assets = len(multi_tf_data[tf0])
+        edges = []
+        symbols = list(multi_tf_data[tf0].keys())
+        for i in range(num_assets):
+            for j in range(i + 1, num_assets):
+                s_i, s_j = symbols[i], symbols[j]
+                if self.ws_manager and s_i in self.ws_manager.data and s_j in self.ws_manager.data:
+                    pi = [self.ws_manager.data[s_i]["close"]] * 10
+                    pj = [self.ws_manager.data[s_j]["close"]] * 10
+                    corr = np.corrcoef(pi, pj)[0, 1]
+                    if abs(corr) > 0.5:
+                        edges.append([i, j])
+                        edges.append([j, i])
+        edge_index = torch.tensor(edges, dtype=torch.long).t().to(self.gnn.device) if edges else torch.tensor([[0, 0]], dtype=torch.long).t().to(self.gnn.device)
+        return Data(edge_index=edge_index)
