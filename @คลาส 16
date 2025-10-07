@@ -1,5 +1,5 @@
 # ==========================================================
-# StrategyGenerator (Enhanced Version - Full Futures Mode + Auto Trailing)
+# StrategyGenerator (Enhanced Version - Full Futures Mode + Auto Trailing + Sync GlobalConfig)
 # ==========================================================
 # ติดตั้งไลบรารีที่ต้องใช้ก่อน:
 # pip install numpy
@@ -7,6 +7,7 @@
 import numpy as np
 import logging
 from config import GlobalConfig  # ✅ ใช้งานจริงในคลาสนี้
+
 
 class StrategyGenerator:
     def __init__(self, trader, env, risk_guardian):
@@ -23,6 +24,28 @@ class StrategyGenerator:
             4: 'CLOSE_SHORT',
         }
 
+        # ✅ ซิงค์ค่าเริ่มต้นจาก GlobalConfig
+        self.sync_from_global_config()
+
+    # ==========================================================
+    # 🔹 sync_from_global_config()
+    # ==========================================================
+    def sync_from_global_config(self):
+        """อัปเดตค่าพารามิเตอร์ทั้งหมดจาก GlobalConfig แบบเรียลไทม์"""
+        self.auto_ml_interval = GlobalConfig.get('auto_ml_interval', 500)
+        self.rl_train_interval = GlobalConfig.get('rl_train_interval', 200)
+        self.bayes_opt_steps = GlobalConfig.get('bayes_opt_steps', 10)
+        self.risk_per_trade = GlobalConfig.get('risk_per_trade', 1.0)
+        self.max_coins_per_trade = GlobalConfig.get('max_coins_per_trade', 3)
+
+        logging.debug(
+            f"[SYNC CONFIG] auto_ml_interval={self.auto_ml_interval}, "
+            f"rl_train_interval={self.rl_train_interval}, "
+            f"bayes_opt_steps={self.bayes_opt_steps}, "
+            f"risk_per_trade={self.risk_per_trade}, "
+            f"max_coins_per_trade={self.max_coins_per_trade}"
+        )
+
     # ==========================================================
     # 🔹 generate_strategy()
     # ==========================================================
@@ -31,11 +54,19 @@ class StrategyGenerator:
         ใช้โมเดลทำนาย action และ continuous output (เช่น leverage, size)
         จากนั้นสร้าง dict กลยุทธ์สำหรับดำเนินการในตลาด Futures
         """
+        # ✅ ตรวจสอบอัปเดตค่า GlobalConfig ก่อนทุกครั้ง
+        self.sync_from_global_config()
+
         discrete_pred, continuous_pred = self.trader.predict(state)
         action_idx = int(np.argmax(discrete_pred[0]))
         action = self.action_map.get(action_idx, 'HOLD')
 
         leverage, size = continuous_pred[0]
+
+        # จำกัดขนาด position ตาม risk_per_trade
+        base_balance = getattr(self.env, "account_balance", 100)
+        max_position_value = base_balance * (self.risk_per_trade / 100)
+        size = min(size, max_position_value)
 
         # ✅ ตรวจสอบทิศทาง (side)
         if action == 'LONG':
@@ -89,6 +120,9 @@ class StrategyGenerator:
         SHORT → เปิด Short
         CLOSE_LONG / CLOSE_SHORT → ปิดสถานะเดิม
         """
+        # ✅ ตรวจสอบอัปเดต config ทุกครั้งก่อนเทรด
+        self.sync_from_global_config()
+
         # ✅ HOLD หรือไม่ผ่าน Risk Check จะไม่ทำการเทรด
         if strategy['action'] == 'HOLD' or not self.risk_guardian.assess_risk(
             self.env.account_balance, self.env.initial_balance
@@ -150,9 +184,9 @@ class StrategyGenerator:
                     updated = True
 
         if updated:
-            # ✅ ป้องกัน KeyError กรณี symbol ไม่มีใน dict
             logging.debug(
-                f"🔄 อัปเดต Trailing SL {strategy.get('symbol', '?')} → {strategy.get('stop_loss', 0):.4f}"
+                f"🔄 อัปเดต Trailing SL {strategy.get('symbol', '?')} → "
+                f"{strategy.get('stop_loss', 0):.4f}"
             )
 
         return strategy
