@@ -1,3 +1,7 @@
+# ==========================================================
+# MultiMarketEnv (ใช้คลาสภายนอก RealTimeSimulator / KPITracker / KPIOptimizer / DynamicIndicatorGenerator)
+# ==========================================================
+
 import os
 import time
 import gymnasium as gym
@@ -18,12 +22,12 @@ TAKER_FEE = GlobalConfig.get('taker_fee', 0.0004)
 SLIPPAGE_DEFAULT = GlobalConfig.get('slippage_default', 0.0005)
 
 
-# ---------------------- Fallback Classes ----------------------
+# ==========================================================
+# 📊 RealTimeSimulator — จำลองข้อมูลตลาด
+# ==========================================================
 class RealTimeSimulator:
     def __init__(self, symbols):
         self.data = {s: pd.DataFrame() for s in symbols}
-
-        # ✅ เพิ่มพารามิเตอร์จำลองจาก GlobalConfig
         self.volatility = GlobalConfig.get('sim_volatility', 0.02)
         self.trend = GlobalConfig.get('sim_trend', 0.001)
         self.spike_chance = GlobalConfig.get('sim_spike_chance', 0.05)
@@ -52,6 +56,9 @@ class RealTimeSimulator:
         return np.zeros(10), None, np.zeros(10), None, None, pd.DataFrame()
 
 
+# ==========================================================
+# 📈 KPITracker — ติดตามผลกำไรสะสม
+# ==========================================================
 class KPITracker:
     def __init__(self):
         self.total_profit = 0
@@ -60,11 +67,17 @@ class KPITracker:
         self.total_profit += profit
 
 
+# ==========================================================
+# ⚙️ KPIOptimizer — ปรับแต่ง KPI อัตโนมัติ
+# ==========================================================
 class KPIOptimizer:
     def optimize(self, val):
         return 1.0
 
 
+# ==========================================================
+# 🔬 DynamicIndicatorGenerator — สร้างอินดิเคเตอร์เสริม
+# ==========================================================
 class DynamicIndicatorGenerator:
     def __init__(self, *_, **__):
         pass
@@ -82,7 +95,7 @@ class DynamicIndicatorGenerator:
 
 
 # ==========================================================
-# คลาสหลัก MultiMarketEnv
+# 🧠 MultiMarketEnv — Environment หลักสำหรับ Simulation / RL / Trading
 # ==========================================================
 class MultiMarketEnv(gym.Env):
     def __init__(
@@ -112,10 +125,13 @@ class MultiMarketEnv(gym.Env):
         self.current_step = 0
         self.day_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
-        # ✅ อัปเดตซิมูเลเตอร์พร้อม config สด
+        # ✅ ใช้คลาสภายนอก (Global Classes)
         self.ws_manager = ws_manager
         self.exchange = exchange
         self.simulator = RealTimeSimulator(self.symbols)
+        self.kpi_tracker = KPITracker()
+        self.kpi_optimizer = KPIOptimizer()
+        self.indicator_gen = DynamicIndicatorGenerator()
 
         self.data, self.raw_data, self.scalers = {}, {}, {}
         self.trader = None
@@ -124,8 +140,12 @@ class MultiMarketEnv(gym.Env):
         # ---------------------- Database ----------------------
         self.trade_log_file = GlobalConfig.get('trade_log_file')
         self.db_conn = sqlite3.connect('env_history.db', timeout=10)
-        self.db_conn.execute("CREATE TABLE IF NOT EXISTS returns (id INTEGER PRIMARY KEY, step INT, return REAL, timestamp REAL)")
-        self.db_conn.execute("CREATE TABLE IF NOT EXISTS historical_data (id INTEGER PRIMARY KEY, symbol TEXT, timestamp REAL, close REAL, volume REAL, funding_rate REAL, depth REAL)")
+        self.db_conn.execute(
+            "CREATE TABLE IF NOT EXISTS returns (id INTEGER PRIMARY KEY, step INT, return REAL, timestamp REAL)"
+        )
+        self.db_conn.execute(
+            "CREATE TABLE IF NOT EXISTS historical_data (id INTEGER PRIMARY KEY, symbol TEXT, timestamp REAL, close REAL, volume REAL, funding_rate REAL, depth REAL)"
+        )
 
         if self.trade_log_file and not os.path.exists(self.trade_log_file):
             pd.DataFrame(
@@ -135,12 +155,10 @@ class MultiMarketEnv(gym.Env):
 
         self.min_kpi_threshold = GlobalConfig.get('min_daily_kpi')
         self.multi_tf_data = {tf: {} for tf in GlobalConfig.get('multi_tf_list', [])}
-        self.kpi_tracker = KPITracker()
-        self.kpi_optimizer = KPIOptimizer()
         self.balance_last_updated = 0
 
     # ==========================================================
-    # ✅ ตรวจสอบและซิงค์ค่าทุกครั้งก่อนเทรด
+    # ✅ Sync Config สดจาก GlobalConfig ทุกครั้ง
     # ==========================================================
     def sync_with_global_config(self):
         """ซิงค์ค่าหลักให้ตรงกับ GlobalConfig ล่าสุด"""
@@ -153,7 +171,7 @@ class MultiMarketEnv(gym.Env):
             self.simulator.sync_with_global()
 
     # ==========================================================
-    # Safe get price
+    # 🧭 Get Price
     # ==========================================================
     def safe_get_price(self, symbol):
         if self.ws_manager and hasattr(self.ws_manager, "get_latest_price"):
@@ -164,23 +182,27 @@ class MultiMarketEnv(gym.Env):
         return 0.0
 
     # ==========================================================
-    # โหลดข้อมูลย้อนหลัง
+    # 📜 โหลดข้อมูลย้อนหลัง
     # ==========================================================
     async def load_historical_data(self, symbol, years=GlobalConfig.get('historical_years', 1)):
         years_ago = datetime.utcnow() - timedelta(days=365 * years)
         with self.db_conn:
             cursor = self.db_conn.execute(
-                "SELECT timestamp, close, volume, funding_rate, depth FROM historical_data WHERE symbol=? AND timestamp>=? ORDER BY timestamp ASC",
+                "SELECT timestamp, close, volume, funding_rate, depth "
+                "FROM historical_data WHERE symbol=? AND timestamp>=? ORDER BY timestamp ASC",
                 (symbol, years_ago.timestamp()),
             )
             data = cursor.fetchall()
         if len(data) < TIMESTEPS and not self.dry_run and self.exchange:
             try:
-                klines = await self.exchange.fetch_ohlcv(symbol, timeframe='1h', since=int(years_ago.timestamp() * 1000), limit=17520)
+                klines = await self.exchange.fetch_ohlcv(
+                    symbol, timeframe='1h', since=int(years_ago.timestamp() * 1000), limit=17520
+                )
                 for kline in klines:
                     timestamp, _, _, _, close, volume = kline
                     self.db_conn.execute(
-                        "INSERT INTO historical_data (symbol, timestamp, close, volume, funding_rate, depth) VALUES (?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO historical_data "
+                        "(symbol, timestamp, close, volume, funding_rate, depth) VALUES (?, ?, ?, ?, ?, ?)",
                         (symbol, timestamp / 1000, close, volume, 0.0001, 0),
                     )
                 self.db_conn.commit()
@@ -189,10 +211,12 @@ class MultiMarketEnv(gym.Env):
         return pd.DataFrame(data, columns=['timestamp', 'close', 'volume', 'funding_rate', 'depth']) if data else pd.DataFrame()
 
     # ==========================================================
-    # Execute Trade
+    # 💹 Execute Trade
     # ==========================================================
-    async def execute_trade_async(self, symbol, action, size, leverage, stop_loss, take_profit,
-                                  trailing_stop=None, trailing_take_profit=None):
+    async def execute_trade_async(
+        self, symbol, action, size, leverage, stop_loss, take_profit,
+        trailing_stop=None, trailing_take_profit=None
+    ):
         self.sync_with_global_config()
         price = self.safe_get_price(symbol)
         if price <= 0:
@@ -231,7 +255,7 @@ class MultiMarketEnv(gym.Env):
         return profit
 
     # ==========================================================
-    # Step
+    # 🔁 Step
     # ==========================================================
     async def step(self):
         self.sync_with_global_config()
