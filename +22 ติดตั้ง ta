@@ -1,34 +1,122 @@
-# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
-# pip install ta pandas
+# ===============================================
+# indicator_calculator.py
+# ดึงข้อมูลจาก WebSocketManager และคำนวณ Indicators อัตโนมัติ
+# ===============================================
 
-import ta
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
+# pip install ta pandas aiohttp
+
+import asyncio
 import pandas as pd
+import ta
+import time
+import logging
 from config import GlobalConfig
+from websocket_manager import WebSocketManager
+
 
 class IndicatorCalculator:
-    def __init__(self, multi_tf_data):
-        self.multi_tf_data = multi_tf_data
+    """คำนวณอินดิเคเตอร์หลาย Timeframe โดยดึงข้อมูลจาก WebSocketManager อัตโนมัติ"""
 
-    def calculate_indicators(self, symbol):
+    def __init__(self, ws_manager: WebSocketManager):
+        self.ws_manager = ws_manager
+        self.multi_tf_data = {}
+        self.last_update = 0
+        # ✅ ดึงค่าช่วงเวลา (timeframes) จาก GlobalConfig เช่น ["1m","5m","1h"]
+        self.multi_tf_list = GlobalConfig.get("multi_tf_list", ["1m", "5m", "1h"])
+        self.sync_interval = int(GlobalConfig.get("indicator_sync_interval", 60))
+        asyncio.create_task(self._auto_sync_loop())
+
+    # ===============================================
+    # 🔁 Auto Sync ข้อมูลจาก WebSocketManager
+    # ===============================================
+    async def _auto_sync_loop(self):
+        """อัปเดต multi_tf_data อัตโนมัติจาก WebSocketManager ตาม config"""
+        await asyncio.sleep(2)
+        while True:
+            try:
+                self._sync_from_ws_manager()
+                await asyncio.sleep(self.sync_interval)
+            except Exception as e:
+                logging.error(f"Indicator sync error: {e}")
+                await asyncio.sleep(10)
+
+    def _sync_from_ws_manager(self):
+        """สร้าง multi_tf_data จากข้อมูลสดใน ws_manager.data"""
+        now = time.time()
+        if now - self.last_update < self.sync_interval:
+            return
+
+        self.multi_tf_data = {tf: {} for tf in self.multi_tf_list}
+        base_data = self.ws_manager.data.copy()
+
+        for symbol, d in base_data.items():
+            # ✅ จำลองแท่งเทียน (OHLCV) จากข้อมูลที่มี
+            price = d.get("close", 0.0)
+            vol = d.get("volume", 0.0)
+            # สำหรับแต่ละ timeframe — สร้าง DataFrame จำลองแท่งเทียนล่าสุด
+            for tf in self.multi_tf_list:
+                df = pd.DataFrame({
+                    "open": [price * 0.999],
+                    "high": [price * 1.001],
+                    "low": [price * 0.998],
+                    "close": [price],
+                    "volume": [vol],
+                })
+                self.multi_tf_data[tf][symbol] = df
+
+        self.last_update = now
+        logging.info(f"✅ อัปเดต multi_tf_data สำเร็จ ({len(base_data)} symbols)")
+
+    # ===============================================
+    # 📊 คำนวณ Indicators
+    # ===============================================
+    def calculate_indicators(self, symbol: str):
+        """คำนวณ indicators จาก multi_tf_data ทุก timeframe"""
         indicators = {}
-        for tf in GlobalConfig.get('multi_tf_list'):
-            df = self.multi_tf_data[tf].get(symbol, pd.DataFrame())
-            if df.empty:
+        if not self.multi_tf_data:
+            logging.warning("⚠️ multi_tf_data ยังไม่มีข้อมูล (รอ WebSocketManager อัปเดต)")
+            return indicators
+
+        for tf in self.multi_tf_list:
+            df = self.multi_tf_data.get(tf, {}).get(symbol, pd.DataFrame())
+            if df.empty or "close" not in df:
+                logging.debug(f"ไม่มีข้อมูล {symbol} ใน timeframe {tf}")
                 continue
-            close = df['close'].values
-            high = df['high'].values if 'high' in df else close
-            low = df['low'].values if 'low' in df else close
-            volume = df['volume'].values
+
+            close = df["close"].values
+            high = df["high"].values if "high" in df else close
+            low = df["low"].values if "low" in df else close
+            volume = df["volume"].values if "volume" in df else [0]
+
             indicators[tf] = {
-                'ATR': ta.volatility.AverageTrueRange(high, low, close).average_true_range().iloc[-1] if len(close) >= 14 else 0,
-                'RSI': ta.momentum.RSIIndicator(close).rsi().iloc[-1] if len(close) >= 14 else 50,
-                'MACD': ta.trend.MACD(close).macd().iloc[-1] if len(close) >= 26 else 0,
-                'EMA': ta.trend.EMAIndicator(close, window=20).ema_indicator().iloc[-1] if len(close) >= 20 else close[-1],
-                'BB_upper': ta.volatility.BollingerBands(close).bollinger_hband().iloc[-1] if len(close) >= 20 else close[-1],
-                'BB_lower': ta.volatility.BollingerBands(close).bollinger_lband().iloc[-1] if len(close) >= 20 else close[-1],
-                'SMA': ta.trend.SMAIndicator(close, window=20).sma_indicator().iloc[-1] if len(close) >= 20 else close[-1],
-                'Stoch_RSI': ta.momentum.StochasticRSIIndicator(close).stochrsi().iloc[-1] if len(close) >= 14 else 0.5,
-                'OBV': ta.volume.OnBalanceVolumeIndicator(close, volume).on_balance_volume().iloc[-1] if len(close) > 1 else volume[-1],
-                'Volume': volume[-1]
+                "ATR": ta.volatility.AverageTrueRange(pd.Series(high), pd.Series(low), pd.Series(close))
+                .average_true_range()
+                .iloc[-1]
+                if len(close) >= 14 else 0,
+                "RSI": ta.momentum.RSIIndicator(pd.Series(close)).rsi().iloc[-1] if len(close) >= 14 else 50,
+                "MACD": ta.trend.MACD(pd.Series(close)).macd().iloc[-1] if len(close) >= 26 else 0,
+                "EMA": ta.trend.EMAIndicator(pd.Series(close), window=20).ema_indicator().iloc[-1]
+                if len(close) >= 20 else close[-1],
+                "BB_upper": ta.volatility.BollingerBands(pd.Series(close)).bollinger_hband().iloc[-1]
+                if len(close) >= 20 else close[-1],
+                "BB_lower": ta.volatility.BollingerBands(pd.Series(close)).bollinger_lband().iloc[-1]
+                if len(close) >= 20 else close[-1],
+                "SMA": ta.trend.SMAIndicator(pd.Series(close), window=20).sma_indicator().iloc[-1]
+                if len(close) >= 20 else close[-1],
+                "Stoch_RSI": ta.momentum.StochasticRSIIndicator(pd.Series(close)).stochrsi().iloc[-1]
+                if len(close) >= 14 else 0.5,
+                "OBV": ta.volume.OnBalanceVolumeIndicator(pd.Series(close), pd.Series(volume))
+                .on_balance_volume()
+                .iloc[-1]
+                if len(close) > 1 else volume[-1],
+                "Volume": float(volume[-1]),
             }
+
         return indicators
+
+    # ===============================================
+    # 🧩 ดึง multi_tf_data (ภายนอกเรียกดู)
+    # ===============================================
+    def get_multi_tf_data(self):
+        return self.multi_tf_data
