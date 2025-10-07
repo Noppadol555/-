@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import logging
 from torch_geometric.data import Data
-# from config import GlobalConfig
+from config import GlobalConfig
 
 class DynamicIndicatorGenerator:
     def __init__(self, evogan, gnn, multi_tf_data, ws_manager=None):
