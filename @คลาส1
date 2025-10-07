@@ -1,6 +1,6 @@
-# ===============================================
-# APIManager Class (Clean Logging)
-# จัดการการเชื่อมต่อ API กับ Binance Futures
+# =============================================== 
+# APIManager Class (Clean Logging + Limit Trading + TP/SL + Trailing + Auto Update)
+# จัดการการเชื่อมต่อ API กับ Binance Futures (พร้อมซิงค์สดกับ config.py)
 # ===============================================
 
 # pip install ccxt tenacity pandas
@@ -44,26 +44,50 @@ class APIManager:
         self.last_time_sync = time.time()
         self.markets: Optional[Dict] = None
 
+        # ✅ ตัวแปรเสริม
+        self.dry_run = GlobalConfig.get('dry_run', True)
+        self.margin_mode = GlobalConfig.get('margin_mode', 'isolated')
+        self.trailing_orders: Dict[str, Dict[str, Any]] = {}
+
+        # ✅ เชื่อมต่อ Binance Futures ผ่าน ccxt
         self.exchange = ccxt_async.binance({
             'apiKey': GlobalConfig.get('binance_api_key'),
             'secret': GlobalConfig.get('binance_api_secret'),
             'enableRateLimit': True,
             'timeout': GlobalConfig.get('api_timeout') * 1000,
-            'options': {'defaultType': 'future', 'adjustForTimeDifference': True},
+            'options': {
+                'defaultType': 'future',
+                'adjustForTimeDifference': True,
+                'defaultMarginMode': self.margin_mode
+            },
             'rateLimit': int(60000 / self.weight_limit)
         })
 
-    # ============================================================
-    # พื้นฐาน
-    # ============================================================
+        logging.info(f"🔄 Real-Time Sync Enabled | Margin Mode = {self.margin_mode.upper()}")
 
+    # ============================================================
+    # CONFIG SYNC
+    # ============================================================
+    def _refresh_config(self):
+        """รีโหลดค่าจาก GlobalConfig"""
+        try:
+            self.dry_run = GlobalConfig.get('dry_run', True)
+            self.margin_mode = GlobalConfig.get('margin_mode', 'isolated')
+        except Exception as e:
+            logging.error(f"⚠️ Error refreshing config: {e}")
+            self.dry_run = True
+
+    # ============================================================
+    # BASIC FUNCTIONS
+    # ============================================================
     async def close(self):
         if self.exchange:
             await self.exchange.close()
 
     async def sync_time_with_exchange(self) -> bool:
         """ซิงโครไนซ์เวลา"""
-        if GlobalConfig.get('dry_run'):
+        self._refresh_config()
+        if self.dry_run:
             self.time_offset = 0
             self.last_time_sync = time.time()
             logging.info("🧪 จำลองการซิงค์เวลา: timeOffset = 0")
@@ -106,9 +130,8 @@ class APIManager:
         self.api_call_timestamps.append(now)
 
     # ============================================================
-    # ดึงข้อมูลย้อนหลัง
+    # HISTORICAL DATA
     # ============================================================
-
     @retry(wait=wait_exponential(multiplier=1, min=3, max=60), stop=stop_after_attempt(5))
     async def fetch_all_usdt_historical(
         self, timeframe: str = "1h", limit: int = 1000,
@@ -142,87 +165,139 @@ class APIManager:
             return {}
 
     # ============================================================
-    # คำสั่ง API (ไม่มี log ซ้ำกับ main)
+    # REAL TRADE MANAGEMENT
     # ============================================================
-
-    async def create_limit_order_with_trailing(self, symbol: str, side: str, amount: float, price: float, callback_rate: float = 0.005):
-        """สร้าง Limit + Trailing"""
+    async def execute_limit_order(
+        self, symbol: str, side: str, amount: float,
+        price: float, take_profit: float = None, stop_loss: float = None,
+        trailing_tp: float = None, trailing_sl: float = None,
+        leverage: int = 20
+    ):
+        """
+        ✅ สร้างคำสั่ง Limit Order พร้อม TP, SL, Trailing
+        """
         await self.rate_limit_control()
-        if GlobalConfig.get('dry_run'):
-            return True
-        try:
-            api_symbol = symbol.replace("/", "")
-            params = {
-                "symbol": api_symbol,
-                "side": side.upper(),
-                "type": "TRAILING_STOP_MARKET",
-                "quantity": amount,
-                "activationPrice": price,
-                "callbackRate": round(callback_rate * 100, 2),
-                "recvWindow": 5000,
-                "timestamp": await self.get_adjusted_timestamp()
-            }
-            order = await self.exchange.fapiPrivate_post_order(params)
-            await self.update_weight(order)
-            return order
-        except Exception as e:
-            logging.error(f"API Error: create_limit_order_with_trailing({symbol}) → {e}")
+        self._refresh_config()
+
+        if self.dry_run:
+            logging.info(f"[DryRun] Skip order: {side} {symbol} {amount}@{price}")
             return None
 
-    async def create_stop_order(self, symbol: str, side: str, amount: float, stop_price: float, params: Optional[dict] = None):
-        """สร้าง Stop-Market"""
-        await self.rate_limit_control()
-        if GlobalConfig.get('dry_run'):
-            return True
         try:
-            api_symbol = symbol.replace("/", "")
-            body = {
-                "symbol": api_symbol,
-                "side": side.upper(),
-                "type": "STOP_MARKET",
-                "stopPrice": round(stop_price, 2),
-                "closePosition": True,
-                "reduceOnly": True,
-                "recvWindow": 5000,
-                "timestamp": await self.get_adjusted_timestamp()
-            }
-            if params:
-                body.update(params)
-            order = await self.exchange.fapiPrivate_post_order(body)
-            await self.update_weight(order)
+            # ตั้งค่าเลเวอเรจและโหมดมาร์จิ้น
+            await self.exchange.set_leverage(leverage, symbol)
+            await self.exchange.set_margin_mode(self.margin_mode, symbol)
+
+            # Limit Order หลัก
+            order = await self.exchange.create_order(
+                symbol=symbol,
+                type="limit",
+                side=side.lower(),
+                amount=amount,
+                price=price,
+                params={"reduceOnly": False}
+            )
+
+            logging.info(f"✅ Limit {side.upper()} {symbol} @ {price} | Lev={leverage}x | Margin={self.margin_mode.upper()}")
+
+            # ตั้ง TP/SL
+            if take_profit:
+                await self._create_tp(symbol, side, amount, take_profit)
+            if stop_loss:
+                await self._create_sl(symbol, side, amount, stop_loss)
+
+            # Trailing
+            if trailing_tp or trailing_sl:
+                self.trailing_orders[symbol] = {
+                    "side": side,
+                    "amount": amount,
+                    "tp": trailing_tp,
+                    "sl": trailing_sl,
+                    "last_update": time.time()
+                }
+                logging.info(f"🌀 ตั้ง Trailing Order: TP={trailing_tp}, SL={trailing_sl}")
+
             return order
         except Exception as e:
-            logging.error(f"API Error: create_stop_order({symbol}) → {e}")
+            logging.error(f"❌ Limit Order Error: {e}")
             return None
 
-    async def update_stop_take_profit(self, symbol: str, stop_price: float, take_price: float):
-        """อัปเดต Stop-Loss / Take-Profit แบบเรียลไทม์"""
-        await self.rate_limit_control()
-        if GlobalConfig.get('dry_run'):
-            return True
+    async def _create_tp(self, symbol: str, side: str, amount: float, price: float):
+        """สร้าง Take Profit"""
+        opposite = "sell" if side.lower() == "buy" else "buy"
         try:
-            api_symbol = symbol.replace("/", "")
-            await self.exchange.fapiPrivate_post_order({
-                "symbol": api_symbol,
-                "side": "SELL",
-                "type": "STOP_MARKET",
-                "stopPrice": round(stop_price, 2),
-                "closePosition": True,
-                "reduceOnly": True,
-                "recvWindow": 5000,
-                "timestamp": await self.get_adjusted_timestamp()
-            })
-            await self.exchange.fapiPrivate_post_order({
-                "symbol": api_symbol,
-                "side": "SELL",
-                "type": "TAKE_PROFIT_MARKET",
-                "stopPrice": round(take_price, 2),
-                "closePosition": True,
-                "reduceOnly": True,
-                "recvWindow": 5000,
-                "timestamp": await self.get_adjusted_timestamp()
-            })
-            return True
+            await self.exchange.create_order(
+                symbol=symbol,
+                type="TAKE_PROFIT_MARKET",
+                side=opposite,
+                amount=amount,
+                params={"stopPrice": round(price, 2), "reduceOnly": True}
+            )
+            logging.info(f"🎯 ตั้ง Take-Profit {symbol} ที่ {price}")
         except Exception as e:
-            logging.error(f"API Error: update_stop_take_profit({symbol}) → {e}")
-            return False
+            logging.warning(f"⚠️ TP Error {symbol}: {e}")
+
+    async def _create_sl(self, symbol: str, side: str, amount: float, price: float):
+        """สร้าง Stop-Loss"""
+        opposite = "sell" if side.lower() == "buy" else "buy"
+        try:
+            await self.exchange.create_order(
+                symbol=symbol,
+                type="STOP_MARKET",
+                side=opposite,
+                amount=amount,
+                params={"stopPrice": round(price, 2), "reduceOnly": True}
+            )
+            logging.info(f"🛑 ตั้ง Stop-Loss {symbol} ที่ {price}")
+        except Exception as e:
+            logging.warning(f"⚠️ SL Error {symbol}: {e}")
+
+    # ============================================================
+    # AUTO TRAILING / UPDATE ORDERS
+    # ============================================================
+    async def monitor_trailing_orders(self):
+        """ตรวจสอบและอัปเดต Trailing Orders อัตโนมัติ"""
+        while True:
+            try:
+                for symbol, info in list(self.trailing_orders.items()):
+                    side = info['side']
+                    tp = info.get('tp')
+                    sl = info.get('sl')
+
+                    ticker = await self.exchange.fetch_ticker(symbol)
+                    price = ticker['last']
+
+                    if tp and ((side == "buy" and price > tp) or (side == "sell" and price < tp)):
+                        new_tp = price * (1 + 0.002 if side == "buy" else 1 - 0.002)
+                        info['tp'] = new_tp
+                        await self._create_tp(symbol, side, info['amount'], new_tp)
+                        logging.info(f"🔁 ปรับ TP ใหม่ {symbol} → {new_tp:.4f}")
+
+                    if sl and ((side == "buy" and price < sl) or (side == "sell" and price > sl)):
+                        new_sl = price * (1 - 0.002 if side == "buy" else 1 + 0.002)
+                        info['sl'] = new_sl
+                        await self._create_sl(symbol, side, info['amount'], new_sl)
+                        logging.info(f"🔁 ปรับ SL ใหม่ {symbol} → {new_sl:.4f}")
+
+                await asyncio.sleep(5)
+            except Exception as e:
+                logging.error(f"⚠️ Trailing Monitor Error: {e}")
+                await asyncio.sleep(10)
+
+    # ============================================================
+    # CLOSE ORDERS
+    # ============================================================
+    async def close_position(self, symbol: str, side: str, amount: float):
+        """ปิดสถานะฝั่ง Long หรือ Short"""
+        opposite = "sell" if side.lower() == "buy" else "buy"
+        try:
+            await self.exchange.create_order(
+                symbol=symbol,
+                type="market",
+                side=opposite,
+                amount=amount,
+                params={"reduceOnly": True}
+            )
+            logging.info(f"🚪 ปิดสถานะ {side.upper()} {symbol}")
+        except Exception as e:
+            logging.error(f"❌ ปิดสถานะล้มเหลว {symbol}: {e}")
