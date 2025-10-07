@@ -3,7 +3,7 @@
 
 import ta
 import pandas as pd
-#from config import GlobalConfig
+from config import GlobalConfig
 
 class IndicatorCalculator:
     def __init__(self, multi_tf_data):
