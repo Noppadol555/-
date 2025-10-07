@@ -1,5 +1,5 @@
 # ===============================================
-# websocket_manager.py  (Auto Fetch All USDT Pairs for Binance Futures • Safe Funding Rate • Historical Buffer)
+# websocket_manager.py  (Auto Fetch All USDT Pairs for Binance Futures • Safe Funding Rate • Historical Buffer • Dynamic Global Sync)
 # ===============================================
 
 import json
@@ -11,10 +11,11 @@ import sqlite3
 import websockets
 import aiohttp
 from datetime import timedelta
-from collections import deque  # ✅ เพิ่มสำหรับ buffer ราคาย้อนหลัง
+from collections import deque
 from tenacity import retry, wait_exponential, stop_after_attempt
 from config import GlobalConfig
-import pandas as pd  # ✅ เพิ่มเพื่อคืนค่า DataFrame ให้ IndicatorCalculator ใช้ได้ตรง ๆ
+import pandas as pd
+
 
 # --------------------------- Logging ---------------------------
 logging.basicConfig(
@@ -33,19 +34,18 @@ DSTREAM_BASE = "wss://dstream.binance.com"
 
 
 class WebSocketManager:
-    """WebSocket Manager สำหรับ Binance Futures (พร้อม funding_rate ปลอดภัย + Historical Buffer)"""
+    """WebSocket Manager สำหรับ Binance Futures (พร้อม funding_rate ปลอดภัย + Historical Buffer + Dynamic Global Sync)"""
 
     def __init__(self, exchange=None, time_offset: int = 0):
-        self.public_base = FSTREAM_BASE
-        self.backup_base = DSTREAM_BASE
         self.exchange = exchange
         self.time_offset = time_offset
+
+        # 🟢 โหลดค่าจาก GlobalConfig ครั้งแรก
+        self.refresh_config(initial=True)
 
         self.running = False
         self.subscribed_symbols = set()
         self.reconnect_attempts = 0
-        self.max_reconnects = int(GlobalConfig.get("max_reconnects", 10))
-
         self.data = {}
         self.cache = {}
         self.listen_key = None
@@ -53,17 +53,41 @@ class WebSocketManager:
         self.last_data_time = time.time()
         self.all_usdt_pairs = []
         self.balance_data = {"free": 0.0, "locked": 0.0}
-
-        # ✅ เพิ่ม buffer สำหรับเก็บข้อมูลราคาย้อนหลัง
-        self.price_buffer = {}  # {symbol: deque(maxlen=N)}
+        self.price_buffer = {}
 
         # --------- SQLite ---------
         self.db_conn = sqlite3.connect(
-            GlobalConfig.get("db_path", "market.db"),
+            GlobalConfig.get("db_path", "ws_backup.db"),
             timeout=10,
-            check_same_thread=False  # ✅ ป้องกัน sqlite lock ข้าม thread
+            check_same_thread=False
         )
         self._init_db()
+
+    # ---------------------- Dynamic Config Sync ----------------------
+    def refresh_config(self, initial: bool = False):
+        """🟢 อัปเดตค่าจาก GlobalConfig ให้เป็นปัจจุบัน"""
+        self.public_base = GlobalConfig.get("ws_url", FSTREAM_BASE)
+        self.backup_base = GlobalConfig.get("ws_backup_url", DSTREAM_BASE)
+        self.max_reconnects = int(GlobalConfig.get("max_reconnects", 10))
+        self.reconnect_delay_max = int(GlobalConfig.get("reconnect_delay_max", 60))
+        self.ws_timeout = int(GlobalConfig.get("ws_timeout", 10))
+        self.db_path = GlobalConfig.get("db_path", "ws_backup.db")
+        self.cache_size_max = int(GlobalConfig.get("cache_size_max", 1000))
+        self.data_retention_limit = int(GlobalConfig.get("data_retention_limit", 100))
+        self.multi_tf_list = list(GlobalConfig.get("multi_tf_list", []))
+        self.historical_years = int(GlobalConfig.get("historical_years", 5))
+
+        if not initial:
+            logging.info("🔄 GlobalConfig ของ WebSocketManager ถูกอัปเดตเรียบร้อย")
+
+    async def auto_sync_config_loop(self, interval: int = 30):
+        """ลูปอัปเดตค่า config สดจาก GlobalConfig ทุก ๆ X วินาที"""
+        while True:
+            try:
+                self.refresh_config()
+            except Exception as e:
+                logging.error(f"อัปเดต GlobalConfig ใน WebSocketManager ล้มเหลว: {e}")
+            await asyncio.sleep(interval)
 
     # --------------------------- DB ---------------------------
     def _init_db(self):
@@ -81,7 +105,6 @@ class WebSocketManager:
         self.db_conn.commit()
 
     async def _commit_safe(self):
-        """✅ commit แบบไม่บล็อค event loop"""
         try:
             await asyncio.to_thread(self.db_conn.commit)
         except Exception as e:
@@ -89,7 +112,6 @@ class WebSocketManager:
 
     # ---------------------- Fetch all USDT pairs ----------------------
     async def fetch_all_usdt_pairs(self):
-        """ดึงคู่เหรียญทั้งหมดที่ลงท้ายด้วย USDT จาก Binance Futures"""
         url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
         try:
             async with aiohttp.ClientSession() as session:
@@ -108,7 +130,6 @@ class WebSocketManager:
 
     # ---------------------- Safe getter ----------------------
     def get_symbol_data(self, symbol: str) -> dict:
-        """ดึงข้อมูล symbol พร้อม fallback ปลอดภัย (กัน KeyError ทุกกรณี)"""
         d = self.data.get(symbol, {})
         return {
             "timestamp": d.get("timestamp", time.time()),
@@ -118,14 +139,12 @@ class WebSocketManager:
             "depth": d.get("depth", {}),
         }
 
-    # 🟢 คืนค่าราคาล่าสุด
     def get_latest_price(self, symbol: str) -> float:
         try:
             return float(self.data.get(symbol, {}).get("close", 0.0))
         except Exception:
             return 0.0
 
-    # 🟢 คืนค่ายอดเงินล่าสุด
     def get_latest_balance(self) -> float:
         try:
             return float(self.balance_data.get("free", GlobalConfig.get("initial_balance", 100.0)))
@@ -172,7 +191,7 @@ class WebSocketManager:
                 logging.error(f"keep alive user stream ล้มเหลว: {e}")
 
     async def _listen_user_stream(self, listen_key: str):
-        url = f"{FSTREAM_BASE}/ws/{listen_key}"
+        url = f"{self.public_base}/ws/{listen_key}"
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                 logging.info("✅ เชื่อมต่อ user stream สำเร็จ")
@@ -201,6 +220,9 @@ class WebSocketManager:
             logging.error("❌ ไม่พบคู่ USDT ใดๆ")
             return
 
+        # 🟢 เริ่ม task sync config สด
+        asyncio.create_task(self.auto_sync_config_loop())
+
         chunks = [self.all_usdt_pairs[i:i + 1024] for i in range(0, len(self.all_usdt_pairs), 1024)]
         for idx, chunk in enumerate(chunks):
             asyncio.create_task(self._start_chunk(chunk, idx))
@@ -221,23 +243,25 @@ class WebSocketManager:
         reconnects = 0
 
         while self.running:
+            self.refresh_config()  # ✅ ตรวจสอบ config ทุกครั้งก่อน reconnect
             url = self._build_public_url(bases[idx])
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                     logging.info(f"✅ [{group_idx}] เชื่อมต่อสำเร็จ {len(symbols)} คู่")
                     while self.running:
                         try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                            raw = await asyncio.wait_for(ws.recv(), timeout=self.ws_timeout)
                             data = json.loads(raw)
                             await self._handle_public_message(data)
                         except asyncio.TimeoutError:
-                            pong_waiter = await ws.ping()  # ✅ ping จริง
+                            pong_waiter = await ws.ping()
                             await pong_waiter
                             logging.debug(f"[{group_idx}] waiting data...")
             except Exception as e:
                 reconnects += 1
+                delay = min(5 * reconnects, self.reconnect_delay_max)
                 logging.warning(f"[{group_idx}] reconnect {reconnects} : {e}")
-                await asyncio.sleep(min(5 * reconnects, 60))
+                await asyncio.sleep(delay)
                 idx = (idx + 1) % len(bases)
 
     # ---------------------- Handlers ----------------------
@@ -251,7 +275,7 @@ class WebSocketManager:
             price = float(msg.get("c", 0))
             vol = float(msg.get("v", 0))
             ts = time.time()
-            self.last_data_time = ts  # ✅ อัปเดตเวลาเมื่อได้รับข้อมูลจริง
+            self.last_data_time = ts
 
             funding_rate = await self._safe_fetch_funding_rate(symbol)
             self.data[symbol] = {
@@ -263,7 +287,6 @@ class WebSocketManager:
             }
             self.cache[symbol] = self.data[symbol]
 
-            # ✅ เพิ่มการเก็บ buffer ราคาย้อนหลัง
             if symbol not in self.price_buffer:
                 self.price_buffer[symbol] = deque(maxlen=500)
             self.price_buffer[symbol].append({
@@ -276,7 +299,6 @@ class WebSocketManager:
                 "INSERT INTO ws_data (symbol, timestamp, close, volume, funding_rate, depth) VALUES (?, ?, ?, ?, ?, ?)",
                 (symbol, ts, price, vol, funding_rate, 0),
             )
-            # ✅ ใช้ commit แบบ async เพื่อไม่บล็อค event loop
             await self._commit_safe()
 
             logging.info(f"📈 {symbol} = {price:.2f} | Vol={vol:.2f} | FR={funding_rate:.6f}")
@@ -284,7 +306,6 @@ class WebSocketManager:
             logging.error(f"เกิดข้อผิดพลาดใน _handle_public_message: {e}")
 
     async def _safe_fetch_funding_rate(self, symbol: str) -> float:
-        """ดึง funding rate จาก Binance Futures แบบปลอดภัย (คืนค่า 0.0 ถ้าล้มเหลว)"""
         try:
             url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}"
             async with aiohttp.ClientSession() as session:
@@ -334,7 +355,6 @@ class WebSocketManager:
 
     # ---------------------- Historical Buffer Interface ----------------------
     def get_recent_ohlcv(self, symbol: str, limit: int = 100) -> pd.DataFrame:
-        """✅ คืนค่า OHLCV จาก buffer ล่าสุด (ใช้คำนวณอินดิเคเตอร์ได้จริง)"""
         data = list(self.price_buffer.get(symbol, []))[-limit:]
         if not data:
             return pd.DataFrame()
