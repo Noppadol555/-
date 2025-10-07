@@ -1,9 +1,9 @@
 # ===============================================
-# RiskGuardian Class (ต้นฉบับ + ปรับปรุงกันพัง funding_rate)
+# RiskGuardian Class (ปรับปรุงให้ซิงค์กับ GlobalConfig อัตโนมัติ)
 # ===============================================
 
-# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันคำสั่งเหล่านี้ใน terminal ก่อนใช้งาน)
-# pip install numpy collections asyncio
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันใน Terminal ก่อนใช้งาน)
+# pip install numpy
 
 import numpy as np
 from collections import deque
@@ -14,21 +14,31 @@ from config import GlobalConfig
 
 class RiskGuardian:
     """
-    คลาสสำหรับประเมินความเสี่ยงของระบบเทรด:
+    คลาสสำหรับประเมินและควบคุมความเสี่ยงของระบบเทรด:
       - ตรวจจับ drawdown เกินขีดจำกัด
       - ตรวจสอบการขาดทุนต่อ position
       - ปรับ dynamic risk ตามความผันผวนตลาด
       - ปิด position ทั้งหมดเมื่อเกิดภาวะฉุกเฉิน
+      - ซิงค์ค่า risk จาก GlobalConfig แบบเรียลไทม์
     """
 
-    def __init__(
-        self,
-        max_drawdown=GlobalConfig.get('max_drawdown'),
-        cut_loss_threshold=GlobalConfig.get('cut_loss_threshold'),
-        ws_manager=None
-    ):
-        self.max_drawdown = max_drawdown
-        self.cut_loss_threshold = cut_loss_threshold
+    def __init__(self, ws_manager=None):
+        # ค่าจาก GlobalConfig
+        self.max_drawdown = GlobalConfig.get('max_drawdown', 0.2)
+        self.cut_loss_threshold = GlobalConfig.get('cut_loss_threshold', 0.5)
+        self.stop_loss_percentage = GlobalConfig.get('stop_loss_percentage', 0.005)
+        self.loss_strategy = GlobalConfig.get('loss_strategy', 'dynamic')
+        self.profit_lock_percentage = GlobalConfig.get('profit_lock_percentage', 0.05)
+        self.risk_per_trade = GlobalConfig.get('risk_per_trade', 1.0)
+        self.target_kpi_daily = GlobalConfig.get('target_kpi_daily', 100000.0)
+        self.min_daily_kpi = GlobalConfig.get('min_daily_kpi', 50000.0)
+        self.initial_balance = GlobalConfig.get('initial_balance', 100)
+        self.reinvest_profits = GlobalConfig.get('reinvest_profits', True)
+        self.auto_bug_fix = GlobalConfig.get('auto_bug_fix', True)
+        self.bug_fix_attempts = GlobalConfig.get('bug_fix_attempts', 5)
+        self.resource_adaptive = GlobalConfig.get('resource_adaptive', True)
+
+        # ตัวแปรภายใน
         self.drawdown_history = deque(maxlen=1440)
         self.positions = {}
         self.total_trades = 0
@@ -37,13 +47,44 @@ class RiskGuardian:
         self.dynamic_risk_factor = 1.0
         self.volatility_history = deque(maxlen=60)
         self.ws_manager = ws_manager
+        self.last_update_time = 0
 
-    # ==========================
-    # ประเมิน Drawdown ปัจจุบัน
-    # ==========================
-    def assess_risk(self, balance, initial_balance):
+        logging.info("✅ RiskGuardian initialized และเชื่อม GlobalConfig สำเร็จ")
+
+    # ======================================================
+    # 🔁 อัปเดตค่าพารามิเตอร์จาก GlobalConfig แบบเรียลไทม์
+    # ======================================================
+    def update_from_config(self):
+        """ซิงค์ค่าพารามิเตอร์ทั้งหมดให้ตรงกับ GlobalConfig"""
+        try:
+            self.max_drawdown = GlobalConfig.get('max_drawdown', self.max_drawdown)
+            self.cut_loss_threshold = GlobalConfig.get('cut_loss_threshold', self.cut_loss_threshold)
+            self.stop_loss_percentage = GlobalConfig.get('stop_loss_percentage', self.stop_loss_percentage)
+            self.loss_strategy = GlobalConfig.get('loss_strategy', self.loss_strategy)
+            self.profit_lock_percentage = GlobalConfig.get('profit_lock_percentage', self.profit_lock_percentage)
+            self.risk_per_trade = GlobalConfig.get('risk_per_trade', self.risk_per_trade)
+            self.target_kpi_daily = GlobalConfig.get('target_kpi_daily', self.target_kpi_daily)
+            self.min_daily_kpi = GlobalConfig.get('min_daily_kpi', self.min_daily_kpi)
+            self.initial_balance = GlobalConfig.get('initial_balance', self.initial_balance)
+            self.reinvest_profits = GlobalConfig.get('reinvest_profits', self.reinvest_profits)
+            self.auto_bug_fix = GlobalConfig.get('auto_bug_fix', self.auto_bug_fix)
+            self.bug_fix_attempts = GlobalConfig.get('bug_fix_attempts', self.bug_fix_attempts)
+            self.resource_adaptive = GlobalConfig.get('resource_adaptive', self.resource_adaptive)
+            logging.debug("🔄 RiskGuardian synced with GlobalConfig สำเร็จ")
+        except Exception as e:
+            logging.error(f"❌ อัปเดตค่าจาก GlobalConfig ล้มเหลว: {e}")
+
+    # ======================================================
+    # 📉 ประเมิน Drawdown ปัจจุบัน
+    # ======================================================
+    def assess_risk(self, balance, initial_balance=None):
+        self.update_from_config()
+        if initial_balance is None:
+            initial_balance = self.initial_balance
+
         current_drawdown = (initial_balance - balance) / initial_balance
         self.drawdown_history.append(current_drawdown)
+
         if current_drawdown > self.max_drawdown * self.dynamic_risk_factor:
             logging.warning(
                 f"⚠️ Drawdown เกินขีดจำกัด: {current_drawdown:.2%} > "
@@ -52,14 +93,17 @@ class RiskGuardian:
             return False
         return True
 
-    # ==========================
-    # ตรวจสอบความเสี่ยงของ position เดียว
-    # ==========================
+    # ======================================================
+    # 📊 ตรวจสอบความเสี่ยงของ position เดียว
+    # ======================================================
     def evaluate_position(self, symbol, current_price, entry_price, size, leverage, side):
+        self.update_from_config()
+
         unrealized_pnl = (current_price - entry_price) * size * leverage * (1 if side == 'BUY' else -1)
         position_value = size * entry_price / leverage
         loss_ratio = -unrealized_pnl / position_value
         adjusted_threshold = self.cut_loss_threshold * self.dynamic_risk_factor
+
         if loss_ratio > adjusted_threshold:
             logging.warning(
                 f"ตำแหน่ง {symbol} ขาดทุนเกิน {adjusted_threshold:.2%}: {loss_ratio:.2%}"
@@ -67,15 +111,16 @@ class RiskGuardian:
             return False
         return True
 
-    # ==========================
-    # ปรับ dynamic risk factor จากความผันผวนตลาด
-    # ==========================
+    # ======================================================
+    # 📈 ปรับ dynamic risk factor จากความผันผวนตลาด
+    # ======================================================
     async def update_dynamic_risk(self, ws_data):
+        self.update_from_config()
+
         volatilities = []
         for symbol in ws_data:
             if 'close' in ws_data[symbol]:
                 try:
-                    # ตรวจและใช้ funding_rate (หากไม่มี ให้ใช้ค่า 0.0)
                     funding_rate = ws_data[symbol].get('funding_rate', 0.0)
                     if 'funding_rate' not in ws_data[symbol]:
                         logging.debug(f"ไม่มี funding_rate ใน {symbol} → ใช้ค่า 0.0")
@@ -92,19 +137,17 @@ class RiskGuardian:
         if volatilities:
             avg_volatility = np.std(volatilities)
             self.volatility_history.append(avg_volatility)
-            avg_vol_history = (
-                np.mean(self.volatility_history)
-                if self.volatility_history
-                else GlobalConfig.get('min_volatility_threshold')
-            )
+            avg_vol_history = np.mean(self.volatility_history) if self.volatility_history else 0.0
             base_threshold = GlobalConfig.get('min_volatility_threshold', 0.001)
             self.dynamic_risk_factor = min(2.0, max(0.5, avg_vol_history / base_threshold))
             logging.debug(f"🧠 อัปเดต dynamic risk factor: {self.dynamic_risk_factor:.2f}")
 
-    # ==========================
-    # หยุดระบบทั้งหมดและปิด position ทุกตัว
-    # ==========================
+    # ======================================================
+    # 🛑 หยุดระบบทั้งหมดและปิด position ทุกตัว
+    # ======================================================
     async def emergency_stop(self):
+        self.update_from_config()
+
         if not self.env or not self.ws_manager:
             logging.error("env หรือ ws_manager ไม่พร้อมสำหรับ emergency stop")
             return
