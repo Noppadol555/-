@@ -1,0 +1,260 @@
+import os
+import time
+import gymnasium as gym
+import pandas as pd
+import numpy as np
+import openpyxl  # noqa: F401
+import sqlite3
+from datetime import datetime, timedelta
+import asyncio
+import logging
+import keyboard  # noqa: F401
+from collections import deque  # noqa: F401
+from config import GlobalConfig  # ✅ ใช้งานจริงในคลาสนี้
+
+# ---------------------- ค่าเริ่มต้น ----------------------
+TIMESTEPS = GlobalConfig.get('timesteps', 10)
+TAKER_FEE = GlobalConfig.get('taker_fee', 0.0004)
+SLIPPAGE_DEFAULT = GlobalConfig.get('slippage_default', 0.0005)
+
+
+# ---------------------- Fallback Classes ----------------------
+class RealTimeSimulator:
+    def __init__(self, symbols):
+        self.data = {s: pd.DataFrame() for s in symbols}
+
+        # ✅ เพิ่มพารามิเตอร์จำลองจาก GlobalConfig
+        self.volatility = GlobalConfig.get('sim_volatility', 0.02)
+        self.trend = GlobalConfig.get('sim_trend', 0.001)
+        self.spike_chance = GlobalConfig.get('sim_spike_chance', 0.05)
+
+    def sync_with_global(self):
+        """ซิงค์ค่าจำลองให้ตรงกับ GlobalConfig"""
+        self.volatility = GlobalConfig.get('sim_volatility', 0.02)
+        self.trend = GlobalConfig.get('sim_trend', 0.001)
+        self.spike_chance = GlobalConfig.get('sim_spike_chance', 0.05)
+
+    def simulate_step(self):
+        """สุ่มข้อมูลจำลองตาม volatility/trend/spike"""
+        self.sync_with_global()
+        for symbol in self.data:
+            price = 100 + np.random.randn() * self.volatility * 100
+            price += self.trend * 100
+            if np.random.rand() < self.spike_chance:
+                price *= np.random.uniform(0.9, 1.1)
+            df = pd.DataFrame([[time.time(), price]], columns=['timestamp', 'close'])
+            self.data[symbol] = pd.concat([self.data[symbol], df]).tail(1000)
+
+    def reset(self):
+        self.data = {s: pd.DataFrame() for s in self.data.keys()}
+
+    def get_data(self, symbol):
+        return np.zeros(10), None, np.zeros(10), None, None, pd.DataFrame()
+
+
+class KPITracker:
+    def __init__(self):
+        self.total_profit = 0
+
+    async def update(self, profit):
+        self.total_profit += profit
+
+
+class KPIOptimizer:
+    def optimize(self, val):
+        return 1.0
+
+
+class DynamicIndicatorGenerator:
+    def __init__(self, *_, **__):
+        pass
+
+    def generate_synthetic_indicators(self, symbol):
+        return {
+            tf: {
+                "base": {"ATR": 0, "RSI": 0, "MACD": 0, "EMA": 0,
+                         "BB_upper": 0, "BB_lower": 0, "SMA": 0,
+                         "Stoch_RSI": 0, "OBV": 0, "Volume": 0},
+                "synthetic": np.zeros(10),
+                "gnn_correlations": np.zeros(5)
+            } for tf in GlobalConfig.get('multi_tf_list', [])
+        }
+
+
+# ==========================================================
+# คลาสหลัก MultiMarketEnv
+# ==========================================================
+class MultiMarketEnv(gym.Env):
+    def __init__(
+        self,
+        account_balance=None,
+        risk_per_trade=None,
+        dry_run=None,
+        ws_manager=None,
+        exchange=None,
+    ):
+        super().__init__()
+
+        # ✅ โหลดค่าแบบ Real-Time จาก GlobalConfig
+        self.initial_balance = GlobalConfig.get('initial_balance', 100)
+        self.account_balance = account_balance or self.initial_balance
+        self.available_balance = self.account_balance
+        self.reinvest_profits = GlobalConfig.get('reinvest_profits', True)
+
+        self.risk_per_trade = risk_per_trade or GlobalConfig.get('risk_per_trade', 1.0)
+        self.stop_loss_percentage = GlobalConfig.get('stop_loss_percentage', 0.005)
+        self.profit_lock_percentage = GlobalConfig.get('profit_lock_percentage', 0.05)
+        self.dry_run = dry_run if dry_run is not None else GlobalConfig.get('dry_run', True)
+
+        self.reinvest_cap = self.initial_balance * 2
+        self.symbols = []
+        self.positions = {}
+        self.current_step = 0
+        self.day_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # ✅ อัปเดตซิมูเลเตอร์พร้อม config สด
+        self.ws_manager = ws_manager
+        self.exchange = exchange
+        self.simulator = RealTimeSimulator(self.symbols)
+
+        self.data, self.raw_data, self.scalers = {}, {}, {}
+        self.trader = None
+        self._trade_queue = []
+
+        # ---------------------- Database ----------------------
+        self.trade_log_file = GlobalConfig.get('trade_log_file')
+        self.db_conn = sqlite3.connect('env_history.db', timeout=10)
+        self.db_conn.execute("CREATE TABLE IF NOT EXISTS returns (id INTEGER PRIMARY KEY, step INT, return REAL, timestamp REAL)")
+        self.db_conn.execute("CREATE TABLE IF NOT EXISTS historical_data (id INTEGER PRIMARY KEY, symbol TEXT, timestamp REAL, close REAL, volume REAL, funding_rate REAL, depth REAL)")
+
+        if self.trade_log_file and not os.path.exists(self.trade_log_file):
+            pd.DataFrame(
+                columns=['DateTime', 'Symbol', 'TradeType', 'BuyPrice', 'SellPrice',
+                         'Quantity', 'Capital', 'ProfitLoss']
+            ).to_excel(self.trade_log_file, index=False)
+
+        self.min_kpi_threshold = GlobalConfig.get('min_daily_kpi')
+        self.multi_tf_data = {tf: {} for tf in GlobalConfig.get('multi_tf_list', [])}
+        self.kpi_tracker = KPITracker()
+        self.kpi_optimizer = KPIOptimizer()
+        self.balance_last_updated = 0
+
+    # ==========================================================
+    # ✅ ตรวจสอบและซิงค์ค่าทุกครั้งก่อนเทรด
+    # ==========================================================
+    def sync_with_global_config(self):
+        """ซิงค์ค่าหลักให้ตรงกับ GlobalConfig ล่าสุด"""
+        self.initial_balance = GlobalConfig.get('initial_balance', self.initial_balance)
+        self.reinvest_profits = GlobalConfig.get('reinvest_profits', self.reinvest_profits)
+        self.risk_per_trade = GlobalConfig.get('risk_per_trade', self.risk_per_trade)
+        self.stop_loss_percentage = GlobalConfig.get('stop_loss_percentage', self.stop_loss_percentage)
+        self.profit_lock_percentage = GlobalConfig.get('profit_lock_percentage', self.profit_lock_percentage)
+        if hasattr(self.simulator, "sync_with_global"):
+            self.simulator.sync_with_global()
+
+    # ==========================================================
+    # Safe get price
+    # ==========================================================
+    def safe_get_price(self, symbol):
+        if self.ws_manager and hasattr(self.ws_manager, "get_latest_price"):
+            try:
+                return float(self.ws_manager.get_latest_price(symbol))
+            except Exception as e:
+                logging.error(f"safe_get_price error: {e}")
+        return 0.0
+
+    # ==========================================================
+    # โหลดข้อมูลย้อนหลัง
+    # ==========================================================
+    async def load_historical_data(self, symbol, years=GlobalConfig.get('historical_years', 1)):
+        years_ago = datetime.utcnow() - timedelta(days=365 * years)
+        with self.db_conn:
+            cursor = self.db_conn.execute(
+                "SELECT timestamp, close, volume, funding_rate, depth FROM historical_data WHERE symbol=? AND timestamp>=? ORDER BY timestamp ASC",
+                (symbol, years_ago.timestamp()),
+            )
+            data = cursor.fetchall()
+        if len(data) < TIMESTEPS and not self.dry_run and self.exchange:
+            try:
+                klines = await self.exchange.fetch_ohlcv(symbol, timeframe='1h', since=int(years_ago.timestamp() * 1000), limit=17520)
+                for kline in klines:
+                    timestamp, _, _, _, close, volume = kline
+                    self.db_conn.execute(
+                        "INSERT INTO historical_data (symbol, timestamp, close, volume, funding_rate, depth) VALUES (?, ?, ?, ?, ?, ?)",
+                        (symbol, timestamp / 1000, close, volume, 0.0001, 0),
+                    )
+                self.db_conn.commit()
+            except Exception as e:
+                logging.error(f"โหลดข้อมูลย้อนหลังล้มเหลว: {e}")
+        return pd.DataFrame(data, columns=['timestamp', 'close', 'volume', 'funding_rate', 'depth']) if data else pd.DataFrame()
+
+    # ==========================================================
+    # Execute Trade
+    # ==========================================================
+    async def execute_trade_async(self, symbol, action, size, leverage, stop_loss, take_profit,
+                                  trailing_stop=None, trailing_take_profit=None):
+        self.sync_with_global_config()
+        price = self.safe_get_price(symbol)
+        if price <= 0:
+            return 0.0
+        pos = self.positions.get(symbol)
+        profit = 0.0
+
+        # HOLD
+        if action == "HOLD":
+            return 0.0
+
+        # เปิด LONG
+        if action == "LONG":
+            entry_cost = (size * price) / leverage * (1 + TAKER_FEE + SLIPPAGE_DEFAULT)
+            if entry_cost > self.available_balance:
+                logging.warning(f"Margin ไม่พอสำหรับ {symbol}")
+                return 0.0
+            self.positions[symbol] = {
+                'side': 'LONG', 'entry_price': price, 'size': size, 'leverage': leverage,
+                'stop_loss': price * (1 - self.stop_loss_percentage),
+                'take_profit': price * (1 + self.profit_lock_percentage)
+            }
+            self.available_balance -= entry_cost
+            return {"status": "ORDER_PLACED", "symbol": symbol, "side": "LONG"}
+
+        # ปิด LONG
+        if action == "CLOSE_LONG" and pos and pos['side'] == 'LONG':
+            entry = pos['entry_price']
+            pnl = ((price - entry) * pos['size'] * pos['leverage']) / entry
+            profit = pnl - (TAKER_FEE + SLIPPAGE_DEFAULT)
+            self.account_balance += profit
+            self.available_balance += pos['size'] * price / pos['leverage']
+            del self.positions[symbol]
+            return profit
+
+        return profit
+
+    # ==========================================================
+    # Step
+    # ==========================================================
+    async def step(self):
+        self.sync_with_global_config()
+        if self.dry_run:
+            self.simulator.simulate_step()
+        rewards = []
+        for s in self.symbols:
+            price = self.safe_get_price(s)
+            rewards.append(price / 100000)
+        total_profit = sum(rewards)
+        self.current_step += 1
+        done = self.current_step >= 10
+        return np.array(rewards), rewards, done, {'profit': total_profit}
+
+    # ==========================================================
+    def get_observation(self):
+        return np.zeros((len(self.symbols), 20))
+
+    def reset(self):
+        self.sync_with_global_config()
+        self.account_balance = self.initial_balance
+        self.available_balance = self.initial_balance
+        self.positions = {s: None for s in self.symbols}
+        self.current_step = 0
+        if self.dry_run:
+            self.simulator.reset()
