@@ -3,7 +3,11 @@
 # ===============================================
 
 from config import GlobalConfig
-import asyncio, logging, traceback, os, time, numpy as np, pandas as pd, torch, keyboard
+import asyncio, logging, traceback, os, keyboard
+import numpy as np
+import pandas as pd
+import torch
+import time
 
 
 # ==============================
@@ -133,31 +137,19 @@ async def sync_real_trailing_orders(ws_manager, api_manager, trader, interval=30
 
 
 # ===============================================
-# ฟังก์ชัน control_loop: ตรวจสอบการกด 'q' เพื่อหยุดระบบอย่างปลอดภัย
+# 🧩 ฟังก์ชัน control_loop — หยุดระบบเมื่อกด 'q'
 # ===============================================
 async def control_loop(ws_manager, api_manager, risk_guardian):
-    """ตรวจสอบ keyboard input เพื่อหยุดระบบอย่างปลอดภัย"""
+    """ตรวจสอบการกด 'q' เพื่อหยุดระบบอย่างปลอดภัย"""
     while GlobalConfig.get('system_running'):
         try:
             if keyboard.is_pressed('q'):
                 GlobalConfig.set('system_running', False)
-                logging.info("🔴 ตรวจพบการกด 'q': กำลังหยุดระบบอย่างปลอดภัย...")
-
-                # ปิด WebSocket
-                if hasattr(ws_manager, "stop"):
-                    await ws_manager.stop()
-                    logging.info("🛑 ปิด WebSocket สำเร็จ")
-
-                # ปิด Exchange
-                if hasattr(api_manager, "exchange") and hasattr(api_manager.exchange, "close"):
+                logging.info("🛑 ตรวจพบการกด 'q': กำลังหยุดระบบอย่างปลอดภัย...")
+                await ws_manager.stop()
+                if hasattr(api_manager, 'exchange'):
                     await api_manager.exchange.close()
-                    logging.info("🛑 ปิด Exchange สำเร็จ")
-
-                # เรียก Emergency Stop
-                if hasattr(risk_guardian, "emergency_stop"):
-                    await risk_guardian.emergency_stop()
-                    logging.info("🛑 ดำเนินการ Emergency Stop สำเร็จ")
-
+                await risk_guardian.emergency_stop()
                 logging.info("✅ ระบบหยุดทำงานและปิดทุกส่วนอย่างปลอดภัยแล้ว")
                 break
         except Exception as e:
@@ -171,11 +163,9 @@ async def control_loop(ws_manager, api_manager, risk_guardian):
 async def main():
     logging.info("เริ่มต้นระบบการเทรดด้วย CONFIG จาก GlobalConfig")
 
-    # ✅ โหลดค่าระดับ log ตาม GlobalConfig
     log_level_str = GlobalConfig.get('log_level', 'INFO').upper()
     logging.getLogger().setLevel(getattr(logging, log_level_str, logging.INFO))
 
-    # ✅ โหลดคลาสทั้งหมด (สมมติว่ามี import แล้วในโปรเจ็กต์จริง)
     api_manager = APIManager()
     ws_manager = WebSocketManager(exchange=api_manager.exchange, time_offset=api_manager.time_offset)
     trader = UnifiedQuantumTrader(GlobalConfig.get('input_dim'))
@@ -200,17 +190,21 @@ async def main():
     env.simulator.update_symbols(env.symbols)
     trader.madrl.update_symbols(env.symbols)
 
-    # ✅ เริ่ม Task พื้นฐาน
+    # ✅ สร้าง Task ทั้งหมด
     asyncio.create_task(resource_manager.monitor_resources())
     asyncio.create_task(status_monitor_loop(ws_manager, api_manager))
     asyncio.create_task(sync_global_config_loop())
     asyncio.create_task(sync_real_trailing_orders(ws_manager, api_manager, trader))
-    asyncio.create_task(control_loop(ws_manager, api_manager, risk_guardian))  # ✅ รวม control loop เข้ามา
+    asyncio.create_task(control_loop(ws_manager, api_manager, risk_guardian))  # ✅ เพิ่ม control_loop
 
     for symbol in env.symbols:
         await env.load_historical_data(symbol)
 
-    GlobalConfig.set('system_running', True)
+    try:
+        GlobalConfig.set('system_running', True)
+    except Exception:
+        GlobalConfig.CONFIG['system_running'] = True
+
     trader.positions = {}
 
     while GlobalConfig.get('system_running'):
