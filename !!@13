@@ -1,0 +1,135 @@
+# ===============================================
+# IntelligentResourceManager (เวอร์ชันอัปเดตสอดคล้อง GlobalConfig สด)
+# ===============================================
+# ติดตั้งไลบรารีที่ต้องใช้สำหรับคลาสนี้ (รันใน terminal ก่อนใช้งาน)
+# pip install psutil asyncio numpy
+
+import asyncio
+import psutil
+import numpy as np
+from collections import deque
+import logging
+from config import GlobalConfig
+
+# ---------------- Logging ----------------
+log_level_str = GlobalConfig.get('log_level', 'INFO').upper()
+log_level = getattr(logging, log_level_str, logging.INFO)
+logging.basicConfig(
+    level=log_level,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+
+class IntelligentResourceManager:
+    """จัดการทรัพยากรระบบ (CPU, RAM) และปรับพฤติกรรมของโมเดลแบบเรียลไทม์"""
+
+    def __init__(self):
+        # บันทึกการใช้งาน CPU/RAM ย้อนหลัง
+        self.cpu_usage = deque(maxlen=60)
+        self.ram_usage = deque(maxlen=60)
+
+        # Batch size เริ่มต้นของแต่ละโมเดล
+        self.model_batch_sizes = {
+            'qnt': 32, 'ddpg': 32, 'ssd': 32, 'evogan': 32,
+            'tft': 32, 'gnn': 32, 'madrl': 32, 'meta': 32
+        }
+
+        # น้ำหนักความสำคัญของงาน (ใช้ในระบบ multitask)
+        self.task_priorities = {'train': 0.7, 'predict': 0.2, 'data_fetch': 0.1}
+
+        # Lock ป้องกัน race condition เวลาปรับค่า
+        self.resource_lock = asyncio.Lock()
+
+        # โหลดค่าพารามิเตอร์เริ่มต้นจาก GlobalConfig
+        self.auto_bug_fix = GlobalConfig.get('auto_bug_fix', True)
+        self.bug_fix_attempts = GlobalConfig.get('bug_fix_attempts', 5)
+        self.resource_adaptive = GlobalConfig.get('resource_adaptive', True)
+        self.min_ram_reserve_mb = GlobalConfig.get('min_ram_reserve_mb', 1024)
+        self.min_cpu_idle_percent = GlobalConfig.get('min_cpu_idle_percent', 20)
+
+        logging.info("✅ IntelligentResourceManager initialized (config synced).")
+
+    async def monitor_resources(self):
+        """เฝ้าตรวจสอบ CPU/RAM แบบเรียลไทม์และอัปเดตตาม GlobalConfig"""
+        process = psutil.Process()
+
+        while GlobalConfig.get('system_running', True):
+            try:
+                # ✅ ดึงค่าการใช้งานปัจจุบัน
+                self.cpu_usage.append(process.cpu_percent(interval=1))
+                self.ram_usage.append(process.memory_info().rss / (1024 * 1024))
+
+                # ✅ sync ค่าจาก GlobalConfig ทุก loop (เพื่อรองรับ dynamic update)
+                self.auto_bug_fix = GlobalConfig.get('auto_bug_fix', self.auto_bug_fix)
+                self.bug_fix_attempts = GlobalConfig.get('bug_fix_attempts', self.bug_fix_attempts)
+                self.resource_adaptive = GlobalConfig.get('resource_adaptive', self.resource_adaptive)
+                self.min_ram_reserve_mb = GlobalConfig.get('min_ram_reserve_mb', self.min_ram_reserve_mb)
+                self.min_cpu_idle_percent = GlobalConfig.get('min_cpu_idle_percent', self.min_cpu_idle_percent)
+
+                # ✅ ถ้าเปิดโหมด adaptive ให้ปรับการใช้ทรัพยากร
+                if self.resource_adaptive:
+                    await self.adjust_resources()
+
+                await asyncio.sleep(60)
+
+            except Exception as e:
+                logging.error(f"⚠️ เกิดข้อผิดพลาดใน monitor_resources(): {e}")
+                if self.auto_bug_fix:
+                    await self._attempt_fix("monitor_resources", e)
+                else:
+                    raise e
+
+    async def adjust_resources(self, trader=None):
+        """ปรับ batch size และโหลดระบบตามการใช้งาน CPU/RAM"""
+        async with self.resource_lock:
+            try:
+                avg_cpu = np.mean(self.cpu_usage) if self.cpu_usage else 50
+                avg_ram = np.mean(self.ram_usage) if self.ram_usage else 1024
+                total_ram = psutil.virtual_memory().total / (1024 * 1024)
+                ram_threshold = total_ram - self.min_ram_reserve_mb
+
+                # 🔻 ลด batch size ถ้า CPU หรือ RAM ใช้งานสูงเกิน
+                if avg_cpu > (100 - self.min_cpu_idle_percent) or avg_ram > ram_threshold:
+                    for model in self.model_batch_sizes:
+                        self.model_batch_sizes[model] = max(1, int(self.model_batch_sizes[model] * 0.8))
+                    logging.warning(
+                        f"⚙️ ลด batch size เนื่องจาก CPU={avg_cpu:.1f}%, RAM={avg_ram:.1f}MB "
+                        f"(threshold={ram_threshold:.0f}MB)"
+                    )
+
+                # 🔺 เพิ่ม batch size ถ้าระบบมีทรัพยากรเหลือเยอะ
+                elif avg_cpu < 50 and avg_ram < (total_ram * 0.5):
+                    for model in self.model_batch_sizes:
+                        self.model_batch_sizes[model] = min(128, int(self.model_batch_sizes[model] * 1.2))
+                    logging.info(
+                        f"⬆️ เพิ่ม batch size เนื่องจาก CPU={avg_cpu:.1f}%, RAM={avg_ram:.1f}MB"
+                    )
+
+                # ✅ อัปเดตข้อมูลให้ trader ถ้ามี
+                if trader and hasattr(trader, "resource_manager"):
+                    trader.resource_manager.model_batch_sizes = self.model_batch_sizes
+
+            except Exception as e:
+                logging.error(f"⚠️ ปรับทรัพยากรล้มเหลว: {e}")
+                if self.auto_bug_fix:
+                    await self._attempt_fix("adjust_resources", e)
+                else:
+                    raise e
+
+    async def _attempt_fix(self, context: str, error: Exception):
+        """พยายามแก้ไขบั๊กอัตโนมัติ (ตามค่า bug_fix_attempts)"""
+        for attempt in range(1, self.bug_fix_attempts + 1):
+            try:
+                logging.warning(f"🛠️ [Attempt {attempt}/{self.bug_fix_attempts}] แก้ไขบั๊กใน {context}: {error}")
+                await asyncio.sleep(3)
+                if context == "monitor_resources":
+                    self.cpu_usage.clear()
+                    self.ram_usage.clear()
+                elif context == "adjust_resources":
+                    for m in self.model_batch_sizes:
+                        self.model_batch_sizes[m] = 32
+                logging.info("✅ แก้ไขบั๊กสำเร็จแล้ว")
+                return
+            except Exception as e:
+                logging.error(f"❌ แก้ไขบั๊กล้มเหลวใน {context}: {e}")
+        logging.critical(f"🚨 ไม่สามารถแก้บั๊กได้หลัง {self.bug_fix_attempts} ครั้ง: {context}")
