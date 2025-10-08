@@ -3,11 +3,39 @@
 # ===============================================
 
 from config import GlobalConfig
-import asyncio, logging, traceback
-import numpy as np
-import pandas as pd
-import torch
-import time
+import asyncio, logging, traceback, os, time, numpy as np, pandas as pd, torch, keyboard
+
+
+# ==============================
+# 🔄 ฟังก์ชันซิงค์ GlobalConfig แบบเรียลไทม์
+# ==============================
+async def sync_global_config_loop(interval=15):
+    """ตรวจสอบและอัปเดตค่าจาก GlobalConfig ทุกๆ interval วินาที"""
+    prev_config = GlobalConfig.CONFIG.copy()
+    while True:
+        try:
+            # ตรวจสอบระดับ log
+            current_level = getattr(logging, GlobalConfig.get('log_level', 'INFO').upper(), logging.INFO)
+            if logging.getLogger().level != current_level:
+                logging.getLogger().setLevel(current_level)
+                logging.info(f"🛠️ อัปเดต log level เป็น {GlobalConfig.get('log_level')}")
+
+            # ตรวจสอบ trade log file
+            trade_log_file = GlobalConfig.get('trade_log_file', 'trade_log.xlsx')
+            if not os.path.exists(trade_log_file):
+                pd.DataFrame(columns=['Time', 'Symbol', 'Action', 'Price', 'PnL']).to_excel(trade_log_file, index=False)
+                logging.info(f"📘 สร้างไฟล์บันทึกเทรดใหม่: {trade_log_file}")
+
+            # ตรวจสอบค่าที่เปลี่ยนจากครั้งก่อน
+            for k, v in GlobalConfig.CONFIG.items():
+                if prev_config.get(k) != v:
+                    logging.info(f"🔁 ค่า CONFIG '{k}' เปลี่ยนจาก {prev_config.get(k)} → {v}")
+                    prev_config[k] = v
+
+        except Exception as e:
+            logging.warning(f"⚠️ GlobalConfig Sync Error: {e}")
+
+        await asyncio.sleep(interval)
 
 
 # ==============================
@@ -18,8 +46,8 @@ async def status_monitor_loop(ws_manager, api_manager, interval=10):
         try:
             ws_ok = "✅" if ws_manager.is_running() else "❌"
             api_ok = "✅" if api_manager and getattr(api_manager, "exchange", None) else "❌"
-            delay = round(time.time() - ws_manager.last_data_time, 1)
-            symbol_count = len(ws_manager.data)
+            delay = round(time.time() - getattr(ws_manager, "last_data_time", time.time()), 1)
+            symbol_count = len(getattr(ws_manager, "data", {}))
             balance = getattr(ws_manager, "balance_data", {}).get("free", 0.0)
             logging.info(
                 f"⏳ STATUS | WebSocket={ws_ok} | API={api_ok} | Symbols={symbol_count} | Delay={delay}s | Balance={balance:.2f} USDT"
@@ -49,7 +77,7 @@ async def auto_update_trailing(strategy, current_price):
                 new_tp = max(take_profit, current_price * (1 + trailing_callback))
                 strategy["stop_loss"], strategy["take_profit"] = new_sl, new_tp
                 mode = "🧪 เทรดจำลอง" if GlobalConfig.get("dry_run") else "💰 เทรดจริง"
-                logging.info(f"{mode} | 🟢🟢 Trailing LONG | {strategy['symbol']} | SL={new_sl:.4f} | TP={new_tp:.4f}")
+                logging.info(f"{mode} | 🟢 Trailing LONG | {strategy['symbol']} | SL={new_sl:.4f} | TP={new_tp:.4f}")
 
         elif action in ["SHORT", "SELL"]:
             if current_price < entry * (1 - trailing_callback):
@@ -57,7 +85,7 @@ async def auto_update_trailing(strategy, current_price):
                 new_tp = min(take_profit, current_price * (1 - trailing_callback))
                 strategy["stop_loss"], strategy["take_profit"] = new_sl, new_tp
                 mode = "🧪 เทรดจำลอง" if GlobalConfig.get("dry_run") else "💰 เทรดจริง"
-                logging.info(f"{mode} | 🔴🔴 Trailing SHORT | {strategy['symbol']} | SL={new_sl:.4f} | TP={new_tp:.4f}")
+                logging.info(f"{mode} | 🔴 Trailing SHORT | {strategy['symbol']} | SL={new_sl:.4f} | TP={new_tp:.4f}")
 
     except Exception as e:
         logging.warning(f"⚠️ Auto Trailing Error: {e}")
@@ -69,10 +97,10 @@ async def auto_update_trailing(strategy, current_price):
 # 📡 ฟังก์ชัน Real Trailing Sync สำหรับเทรดจริง
 # ==============================
 async def sync_real_trailing_orders(ws_manager, api_manager, trader, interval=30):
-    trailing_callback = GlobalConfig.get('trailing_callback_rate', 0.005)
     while True:
         try:
-            if not trader.positions:
+            trailing_callback = GlobalConfig.get('trailing_callback_rate', 0.005)
+            if not getattr(trader, "positions", {}):
                 await asyncio.sleep(interval)
                 continue
 
@@ -86,23 +114,55 @@ async def sync_real_trailing_orders(ws_manager, api_manager, trader, interval=30
                 if not current_price:
                     continue
 
-                # ✅ ตรวจสอบทิศทางและอัปเดต SL/TP ผ่าน API แบบเรียลไทม์
                 if side == "LONG" and current_price > entry_price * (1 + trailing_callback):
                     new_sl = current_price * (1 - trailing_callback)
                     new_tp = current_price * (1 + trailing_callback)
                     await api_manager.update_stop_take_profit(symbol, new_sl, new_tp)
-                    logging.info(f"💰 เทรดจริง | 🟢🟢 Trailing LONG | {symbol} | SL={new_sl:.4f} | TP={new_tp:.4f}")
+                    logging.info(f"💰 เทรดจริง | 🟢 Trailing LONG | {symbol} | SL={new_sl:.4f} | TP={new_tp:.4f}")
 
                 elif side == "SHORT" and current_price < entry_price * (1 - trailing_callback):
                     new_sl = current_price * (1 + trailing_callback)
                     new_tp = current_price * (1 - trailing_callback)
                     await api_manager.update_stop_take_profit(symbol, new_sl, new_tp)
-                    logging.info(f"💰 เทรดจริง | 🔴🔴 Trailing SHORT | {symbol} | SL={new_sl:.4f} | TP={new_tp:.4f}")
+                    logging.info(f"💰 เทรดจริง | 🔴 Trailing SHORT | {symbol} | SL={new_sl:.4f} | TP={new_tp:.4f}")
 
         except Exception as e:
             logging.warning(f"⚠️ Real Trailing Sync Error: {e}")
 
         await asyncio.sleep(interval)
+
+
+# ===============================================
+# ฟังก์ชัน control_loop: ตรวจสอบการกด 'q' เพื่อหยุดระบบอย่างปลอดภัย
+# ===============================================
+async def control_loop(ws_manager, api_manager, risk_guardian):
+    """ตรวจสอบ keyboard input เพื่อหยุดระบบอย่างปลอดภัย"""
+    while GlobalConfig.get('system_running'):
+        try:
+            if keyboard.is_pressed('q'):
+                GlobalConfig.set('system_running', False)
+                logging.info("🔴 ตรวจพบการกด 'q': กำลังหยุดระบบอย่างปลอดภัย...")
+
+                # ปิด WebSocket
+                if hasattr(ws_manager, "stop"):
+                    await ws_manager.stop()
+                    logging.info("🛑 ปิด WebSocket สำเร็จ")
+
+                # ปิด Exchange
+                if hasattr(api_manager, "exchange") and hasattr(api_manager.exchange, "close"):
+                    await api_manager.exchange.close()
+                    logging.info("🛑 ปิด Exchange สำเร็จ")
+
+                # เรียก Emergency Stop
+                if hasattr(risk_guardian, "emergency_stop"):
+                    await risk_guardian.emergency_stop()
+                    logging.info("🛑 ดำเนินการ Emergency Stop สำเร็จ")
+
+                logging.info("✅ ระบบหยุดทำงานและปิดทุกส่วนอย่างปลอดภัยแล้ว")
+                break
+        except Exception as e:
+            logging.warning(f"⚠️ Control Loop Error: {e}")
+        await asyncio.sleep(0.1)
 
 
 # ==============================
@@ -111,6 +171,11 @@ async def sync_real_trailing_orders(ws_manager, api_manager, trader, interval=30
 async def main():
     logging.info("เริ่มต้นระบบการเทรดด้วย CONFIG จาก GlobalConfig")
 
+    # ✅ โหลดค่าระดับ log ตาม GlobalConfig
+    log_level_str = GlobalConfig.get('log_level', 'INFO').upper()
+    logging.getLogger().setLevel(getattr(logging, log_level_str, logging.INFO))
+
+    # ✅ โหลดคลาสทั้งหมด (สมมติว่ามี import แล้วในโปรเจ็กต์จริง)
     api_manager = APIManager()
     ws_manager = WebSocketManager(exchange=api_manager.exchange, time_offset=api_manager.time_offset)
     trader = UnifiedQuantumTrader(GlobalConfig.get('input_dim'))
@@ -135,33 +200,27 @@ async def main():
     env.simulator.update_symbols(env.symbols)
     trader.madrl.update_symbols(env.symbols)
 
+    # ✅ เริ่ม Task พื้นฐาน
     asyncio.create_task(resource_manager.monitor_resources())
     asyncio.create_task(status_monitor_loop(ws_manager, api_manager))
-    asyncio.create_task(sync_real_trailing_orders(ws_manager, api_manager, trader))  # ✅ Trailing จริง
+    asyncio.create_task(sync_global_config_loop())
+    asyncio.create_task(sync_real_trailing_orders(ws_manager, api_manager, trader))
+    asyncio.create_task(control_loop(ws_manager, api_manager, risk_guardian))  # ✅ รวม control loop เข้ามา
 
     for symbol in env.symbols:
         await env.load_historical_data(symbol)
 
-    control_task = asyncio.create_task(control_loop())
-
-    try:
-        GlobalConfig.set('system_running', True)
-    except Exception:
-        GlobalConfig.CONFIG['system_running'] = True
-
-    step_count = 0
+    GlobalConfig.set('system_running', True)
     trader.positions = {}
 
     while GlobalConfig.get('system_running'):
         try:
             mode = "🧪 เทรดจำลอง" if GlobalConfig.get('dry_run') else "💰 เทรดจริง"
-
-            # === ตัวอย่าง Log ของคำสั่งเปิด/ปิด ===
             for symbol in env.symbols:
                 current_price = ws_manager.data.get(symbol, {}).get("close", 0)
                 if not current_price:
                     continue
-                # จำลองการเปิด/ปิดสถานะตัวอย่าง
+
                 action = np.random.choice(["LONG", "SHORT", "CLOSE_LONG", "CLOSE_SHORT", "HOLD"])
                 lev = np.random.randint(1, 100)
                 tp = current_price * 1.01
@@ -188,8 +247,6 @@ async def main():
             traceback.print_exc()
             await risk_guardian.emergency_stop()
             break
-
-    control_task.cancel()
 
 
 if __name__ == "__main__":
