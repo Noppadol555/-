@@ -75,6 +75,78 @@ async def control_loop(ws_manager, api_manager, risk_guardian):
         await asyncio.sleep(0.1)
 
 
+# ===============================================
+# 🔎 ผู้ช่วย Orchestrator (ไม่แตะคลาสเดิม / ใช้เฉพาะในไฟล์นี้)
+# ===============================================
+def _decode_action_from_discrete(discrete_pred):
+    """
+    แปลง output แบบ distribution/score ให้เป็นคำสั่งเทรด: 0=HOLD, 1=LONG, 2=SHORT
+    รองรับทั้งรูป [B,3] หรือ [3]
+    """
+    if discrete_pred is None:
+        return "HOLD"
+    arr = np.array(discrete_pred)
+    if arr.ndim > 1:
+        arr = arr[0]
+    if arr.size == 0:
+        return "HOLD"
+    idx = int(np.argmax(arr))
+    return {0: "HOLD", 1: "LONG", 2: "SHORT"}.get(idx, "HOLD")
+
+
+def _extract_size_and_leverage(continuous_pred, default_size, default_lev=5):
+    """
+    ดึงขนาดสัญญาและเลเวอเรจจาก continuous_pred อย่างปลอดภัย (มี fallback)
+    map: size_scale = clip(pred[0], 0..1), lev_scale = clip(pred[1], 0..1)
+    size = default_size * (0.25 + 0.75*size_scale)  → ไม่น้อยเกิน
+    lev  = int(1 + lev_scale* (GlobalConfig.get('max_leverage', 50)-1))
+    """
+    try:
+        arr = np.array(continuous_pred)
+        if arr.ndim > 1:
+            arr = arr[0]
+        size_scale = float(np.clip(arr[0], 0.0, 1.0)) if arr.size >= 1 else 0.5
+        lev_scale = float(np.clip(arr[1], 0.0, 1.0)) if arr.size >= 2 else (default_lev / max(1, GlobalConfig.get('max_leverage', 50)))
+        size = float(default_size) * (0.25 + 0.75 * size_scale)
+        lev = int(1 + lev_scale * (GlobalConfig.get('max_leverage', 50) - 1))
+        return max(size, 1e-6), max(1, lev)
+    except Exception:
+        return float(default_size), int(default_lev)
+
+
+def _maybe_strategy_refine(strategy_gen, symbol, action, price, tp, sl):
+    """
+    ขอคำแนะนำปรับกลยุทธ์จาก StrategyGenerator ถ้ามีเมธอดที่เข้ากันได้
+    จะคืนค่า (tp, sl) ที่ปรับแล้ว หรือของเดิมถ้าเรียกไม่ได้
+    """
+    try:
+        # รองรับชื่อเมธอดที่อาจต่างกันในโปรเจกต์
+        for name in ("refine", "compose", "suggest", "generate"):
+            f = getattr(strategy_gen, name, None)
+            if callable(f):
+                out = f(symbol=symbol, action=action, price=price, take_profit=tp, stop_loss=sl)
+                if isinstance(out, dict):
+                    tp = float(out.get("take_profit", tp))
+                    sl = float(out.get("stop_loss", sl))
+                break
+    except Exception:
+        pass
+    return tp, sl
+
+
+def _risk_approved(risk_guardian, symbol, action, size, lev):
+    """
+    ตรวจสอบความเสี่ยงก่อนส่งคำสั่ง ถ้าไม่มีเมธอด approve_trade ให้อนุมัติผ่าน
+    """
+    try:
+        f = getattr(risk_guardian, "approve_trade", None)
+        if callable(f):
+            return bool(f(symbol, action, size=size, leverage=lev))
+        return True
+    except Exception:
+        return True
+
+
 # ==============================
 # 🧠 ฟังก์ชันหลัก (MAIN)
 # ==============================
@@ -126,32 +198,65 @@ async def main():
     trader.positions = {}
 
     # ============================================================
-    # 🔁 MAIN TRADING LOOP (เชื่อม APIManager)
+    # 🔁 MAIN TRADING LOOP (เชื่อม APIManager) — AI Orchestrator
     # ============================================================
     while GlobalConfig.get('system_running'):
         try:
             mode = "🧪 เทรดจำลอง" if GlobalConfig.get('dry_run') else "💰 เทรดจริง"
+
             for symbol in env.symbols:
-                current_price = ws_manager.data.get(symbol, {}).get("close", 0)
+                # 1) ✅ ดึงข้อมูลล่าสุดจาก WebSocket
+                ws_rec = ws_manager.data.get(symbol, {})
+                current_price = ws_rec.get("close", 0.0)
                 if not current_price:
                     continue
 
-                action = np.random.choice(["LONG", "SHORT", "CLOSE_LONG", "CLOSE_SHORT", "HOLD"])
-                lev = np.random.randint(1, 100)
-                tp = current_price * 1.01
-                sl = current_price * 0.99
+                # 2) ✅ เตรียม state ให้โมเดล UQT
+                state_data = np.array([[
+                    ws_rec.get("close", 0.0),
+                    ws_rec.get("volume", 0.0),
+                    ws_rec.get("funding_rate", 0.0),
+                    ws_rec.get("depth", 0.0),
+                ]], dtype=np.float32)
 
-                # ✅ เพิ่มการคำนวณ Trailing Stop และส่งให้ API
+                # 3) ✅ ให้ AI พยากรณ์ (รวมโมเดลย่อยภายใน UQT ตามที่เจ้านายออกแบบไว้)
+                discrete_pred, continuous_pred = trader.predict(state_data)
+
+                # 4) ✅ แปลงเป็น action ที่เข้าใจได้
+                if hasattr(trader, "decode_action") and callable(getattr(trader, "decode_action")):
+                    try:
+                        action = trader.decode_action(discrete_pred)
+                    except Exception:
+                        action = _decode_action_from_discrete(discrete_pred)
+                else:
+                    action = _decode_action_from_discrete(discrete_pred)
+
+                # 5) ✅ sizing & leverage จาก continuous_pred (มี fallback)
+                base_size = GlobalConfig.get('trade_amount', 0.01)
+                default_lev = GlobalConfig.get('default_leverage', 5)
+                order_size, lev = _extract_size_and_leverage(continuous_pred, base_size, default_lev)
+
+                # 6) ✅ ตั้ง TP/SL พื้นฐาน และขอ StrategyGenerator ปรับ (ถ้ามี)
+                tp = float(current_price) * (1 + GlobalConfig.get('tp_ratio', 0.01))
+                sl = float(current_price) * (1 - GlobalConfig.get('sl_ratio', 0.01))
+                tp, sl = _maybe_strategy_refine(strategy_gen, symbol, action, current_price, tp, sl)
+
+                # 7) ✅ ตรวจความเสี่ยงก่อนส่งคำสั่งจริง
+                if not _risk_approved(risk_guardian, symbol, action, order_size, lev):
+                    logging.info(f"{mode} | ⛔ ปฏิเสธการเทรด (RiskGuardian) | {symbol} | action={action} | size={order_size:.6f} | lev={lev}x")
+                    continue
+
+                # 8) ✅ Trailing parameters (จาก config)
                 trailing_callback = GlobalConfig.get('trailing_callback_rate', 0.005)
                 if action == "LONG":
                     trailing_tp = current_price * (1 + trailing_callback)
                     trailing_sl = current_price * (1 - trailing_callback)
                     logging.info(
-                        f"{mode} | 🟢 LONG OPEN | {symbol} @ {current_price:.2f} | Lev={lev}x "
-                        f"| TP={tp:.2f} | SL={sl:.2f} | TR_TP={trailing_tp:.2f} | TR_SL={trailing_sl:.2f}"
+                        f"{mode} | 🟢 LONG OPEN | {symbol} @ {current_price:.4f} | size={order_size:.6f} | Lev={lev}x "
+                        f"| TP={tp:.4f} | SL={sl:.4f} | TR_TP={trailing_tp:.4f} | TR_SL={trailing_sl:.4f}"
                     )
                     await api_manager.execute_limit_order(
-                        symbol, "buy", 0.01, current_price,
+                        symbol, "buy", order_size, current_price,
                         take_profit=tp, stop_loss=sl,
                         trailing_tp=trailing_tp, trailing_sl=trailing_sl,
                         leverage=lev
@@ -161,26 +266,26 @@ async def main():
                     trailing_tp = current_price * (1 - trailing_callback)
                     trailing_sl = current_price * (1 + trailing_callback)
                     logging.info(
-                        f"{mode} | 🔴 SHORT OPEN | {symbol} @ {current_price:.2f} | Lev={lev}x "
-                        f"| TP={tp:.2f} | SL={sl:.2f} | TR_TP={trailing_tp:.2f} | TR_SL={trailing_sl:.2f}"
+                        f"{mode} | 🔴 SHORT OPEN | {symbol} @ {current_price:.4f} | size={order_size:.6f} | Lev={lev}x "
+                        f"| TP={tp:.4f} | SL={sl:.4f} | TR_TP={trailing_tp:.4f} | TR_SL={trailing_sl:.4f}"
                     )
                     await api_manager.execute_limit_order(
-                        symbol, "sell", 0.01, current_price,
+                        symbol, "sell", order_size, current_price,
                         take_profit=tp, stop_loss=sl,
                         trailing_tp=trailing_tp, trailing_sl=trailing_sl,
                         leverage=lev
                     )
 
                 elif action == "CLOSE_LONG":
-                    logging.info(f"{mode} | 🟣 CLOSE LONG | {symbol} @ {current_price:.2f}")
-                    await api_manager.close_position(symbol, "buy", 0.01)
+                    logging.info(f"{mode} | 🟣 CLOSE LONG | {symbol} @ {current_price:.4f} | size={order_size:.6f}")
+                    await api_manager.close_position(symbol, "buy", order_size)
 
                 elif action == "CLOSE_SHORT":
-                    logging.info(f"{mode} | 🟣 CLOSE SHORT | {symbol} @ {current_price:.2f}")
-                    await api_manager.close_position(symbol, "sell", 0.01)
+                    logging.info(f"{mode} | 🟣 CLOSE SHORT | {symbol} @ {current_price:.4f} | size={order_size:.6f}")
+                    await api_manager.close_position(symbol, "sell", order_size)
 
                 else:
-                    logging.info(f"{mode} | ⚪ HOLD | {symbol} | Price={current_price:.2f}")
+                    logging.info(f"{mode} | ⚪ HOLD | {symbol} | Price={current_price:.4f}")
 
             await asyncio.sleep(60)
 
