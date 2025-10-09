@@ -143,6 +143,45 @@ class RiskGuardian:
             logging.debug(f"🧠 อัปเดต dynamic risk factor: {self.dynamic_risk_factor:.2f}")
 
     # ======================================================
+    # ✅ ตรวจสอบและอนุมัติคำสั่งเทรด (Approve Trade)
+    # ======================================================
+    def approve_trade(self, symbol: str, side: str, amount: float, price: float, leverage: int = 20):
+        """
+        ตรวจสอบว่าคำสั่งเทรดนี้ผ่านเกณฑ์ความเสี่ยงหรือไม่
+        - ตรวจสอบ Drawdown
+        - ตรวจสอบจำนวน open positions
+        - ตรวจสอบ risk ต่อ trade
+        """
+        self.update_from_config()
+
+        # ดึง balance จาก GlobalConfig หรือค่าเริ่มต้น
+        balance = GlobalConfig.get('balance', self.initial_balance)
+
+        # 1️⃣ ตรวจสอบ Drawdown รวม
+        if not self.assess_risk(balance):
+            logging.warning(f"⛔ ปฏิเสธคำสั่ง {symbol}: Drawdown เกินขีดจำกัด")
+            return False
+
+        # 2️⃣ ตรวจสอบจำนวน open position
+        max_open = GlobalConfig.get('max_open_trades', 5)
+        if len(self.positions) >= max_open:
+            logging.warning(f"⚠️ ปฏิเสธคำสั่ง {symbol}: มี open positions ครบ {max_open} แล้ว")
+            return False
+
+        # 3️⃣ ตรวจสอบ leverage และขนาด order
+        max_lev = GlobalConfig.get('max_leverage', 125)
+        if leverage > max_lev:
+            logging.warning(f"⚠️ Leverage {leverage}x เกินขีดจำกัด → ปรับเป็น {max_lev}x")
+            leverage = max_lev
+
+        if amount <= 0:
+            logging.warning(f"⚠️ ขนาด order {amount} ไม่ถูกต้อง")
+            return False
+
+        logging.info(f"✅ อนุมัติเทรด {symbol} ({side.upper()}) ผ่านเกณฑ์ทั้งหมด")
+        return True
+
+    # ======================================================
     # 🛑 หยุดระบบทั้งหมดและปิด position ทุกตัว
     # ======================================================
     async def emergency_stop(self):
